@@ -129,56 +129,64 @@ class CLIAgent:
     
     def send_command(self, command: str) -> bool:
         """向 Agent 发送命令"""
-        if not self.process_running or self.fd is None:
+        if self.fd is None:
+            self.logger.warning(f"Cannot send command: {self.name} not initialized")
+            return False
+
+        # 检查进程是否还在运行
+        if not self.is_running():
             self.logger.warning(f"Cannot send command: {self.name} not running")
             return False
-        
+
         try:
             # 发送命令 + Enter
             cmd_bytes = (command + '\n').encode('utf-8')
             os.write(self.fd, cmd_bytes)
-            
+
             self.logger.debug(f"→ {self.name}: {command[:60]}")
             return True
-        
+
         except Exception as e:
             self.logger.error(f"Error sending command to {self.name}: {e}")
             return False
     
     def read_output(self, timeout: float = 0.2) -> str:
         """从 Agent 读取输出"""
-        if not self.process_running or not self.stdout_fd:
+        if not self.stdout_fd:
             return ""
-        
+
+        # 首先检查进程是否还在运行
+        if not self.is_running():
+            return ""
+
         output = ""
         start_time = time.time()
-        
+
         try:
             while time.time() - start_time < timeout:
                 # 使用 select 等待数据可读
                 ready, _, _ = select.select([self.stdout_fd], [], [], 0.05)
-                
+
                 if ready:
                     try:
                         chunk = os.read(self.stdout_fd, 4096)
                         if chunk:
                             output += chunk.decode('utf-8', errors='replace')
-                        else:
-                            # EOF - 进程已结束
-                            self.process_running = False
-                            break
+                        # 不要在这里设置 process_running = False
+                        # 空 chunk 不一定意味着进程退出
                     except OSError as e:
-                        if e.errno != 11:  # EAGAIN
-                            self.process_running = False
+                        # EAGAIN/EWOULDBLOCK 是正常的非阻塞错误
+                        if e.errno not in (11, 35):  # EAGAIN, EWOULDBLOCK
+                            self.logger.debug(f"Error reading from {self.name}: {e}")
                         break
-        
+
         except Exception as e:
             self.logger.debug(f"Error reading from {self.name}: {e}")
-        
+
         # 更新缓冲区
         if output:
             self.output_buffer += output
-        
+
         return output
     
     def is_running(self) -> bool:
@@ -376,14 +384,36 @@ NOTES:
         print(help_text)
     
     def _start_monitoring(self):
-        """启动后台监听线程（监控输出）"""
+        """启动后台监听线程（监控输出和进程状态）"""
+        # 跟踪已知的进程状态
+        codex_was_running = self.codex and self.codex.is_running()
+        claude_was_running = self.claude and self.claude.is_running()
+
         def monitor():
+            nonlocal codex_was_running, claude_was_running
+
             while self.monitoring and self.orchestrator.running:
-                # 定期读取 Codex 的输出（用于日志）
-                if self.codex and self.codex.is_running():
-                    output = self.codex.read_output(timeout=0.1)
-                    if output and "[BACKGROUND]" in output:
-                        self.logger.info(f"Codex background: {output[:100]}")
+                # 检查 Codex 状态变化
+                if self.codex:
+                    codex_running_now = self.codex.is_running()
+                    if codex_was_running and not codex_running_now:
+                        self.logger.warning("⚠️  Codex process has exited unexpectedly")
+                        print("\n⚠️  Warning: Codex has stopped running\n")
+                    codex_was_running = codex_running_now
+
+                    # 读取输出（用于日志）
+                    if codex_running_now:
+                        output = self.codex.read_output(timeout=0.1)
+                        if output and "[BACKGROUND]" in output:
+                            self.logger.info(f"Codex background: {output[:100]}")
+
+                # 检查 Claude Code 状态变化
+                if self.claude:
+                    claude_running_now = self.claude.is_running()
+                    if claude_was_running and not claude_running_now:
+                        self.logger.warning("⚠️  Claude Code process has exited unexpectedly")
+                        print("\n⚠️  Warning: Claude Code has stopped running\n")
+                    claude_was_running = claude_running_now
 
                 time.sleep(0.5)
 
