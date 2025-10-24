@@ -82,16 +82,28 @@ class CLIAgent:
             # 保存 stdout_fd 以便后续读取
             self.stdout_fd = self.fd
 
-            # 等待一下确保进程真的启动了
-            time.sleep(0.5)
+            # 等待一下让进程初始化
+            time.sleep(0.3)
 
             # 尝试读取初始输出（可能包含错误信息）
             initial_output = ""
-            try:
-                initial_output = os.read(self.fd, 4096).decode('utf-8', errors='replace')
-                self.output_buffer += initial_output
-            except OSError:
-                pass  # 可能还没有输出
+            max_read_attempts = 5
+            for attempt in range(max_read_attempts):
+                try:
+                    chunk = os.read(self.fd, 4096)
+                    if chunk:
+                        initial_output += chunk.decode('utf-8', errors='replace')
+                        self.output_buffer += chunk.decode('utf-8', errors='replace')
+                except OSError as e:
+                    if e.errno == 5:  # EIO - PTY 已关闭
+                        self.logger.debug(f"{self.name}: PTY closed during startup")
+                        break
+                    elif e.errno in (11, 35):  # EAGAIN/EWOULDBLOCK
+                        break  # 没有更多数据
+                time.sleep(0.1)
+
+            # 再等待一下，确保进程稳定
+            time.sleep(0.5)
 
             # 检查进程是否立即退出
             try:
@@ -103,7 +115,7 @@ class CLIAgent:
 
                     # 显示可能的错误信息
                     if initial_output:
-                        self.logger.error(f"   Output: {initial_output[:200]}")
+                        self.logger.error(f"   Output: {initial_output[:500]}")
 
                     return False
             except OSError:
@@ -176,7 +188,14 @@ class CLIAgent:
                         # 空 chunk 不一定意味着进程退出
                     except OSError as e:
                         # EAGAIN/EWOULDBLOCK 是正常的非阻塞错误
-                        if e.errno not in (11, 35):  # EAGAIN, EWOULDBLOCK
+                        if e.errno in (11, 35):  # EAGAIN, EWOULDBLOCK
+                            continue
+                        # EIO (errno 5) 通常意味着 PTY slave 已关闭（进程退出）
+                        elif e.errno == 5:
+                            self.logger.debug(f"{self.name}: PTY closed (process likely exited)")
+                            self.process_running = False
+                            break
+                        else:
                             self.logger.debug(f"Error reading from {self.name}: {e}")
                         break
 
@@ -399,13 +418,17 @@ NOTES:
                     if codex_was_running and not codex_running_now:
                         self.logger.warning("⚠️  Codex process has exited unexpectedly")
                         print("\n⚠️  Warning: Codex has stopped running\n")
+                        print("codex> ", end='', flush=True)  # 重新显示提示符
                     codex_was_running = codex_running_now
 
-                    # 读取输出（用于日志）
+                    # 只在进程运行时读取输出
                     if codex_running_now:
-                        output = self.codex.read_output(timeout=0.1)
-                        if output and "[BACKGROUND]" in output:
-                            self.logger.info(f"Codex background: {output[:100]}")
+                        try:
+                            output = self.codex.read_output(timeout=0.1)
+                            if output and "[BACKGROUND]" in output:
+                                self.logger.info(f"Codex background: {output[:100]}")
+                        except Exception as e:
+                            self.logger.debug(f"Error in monitor reading codex: {e}")
 
                 # 检查 Claude Code 状态变化
                 if self.claude:
@@ -413,6 +436,7 @@ NOTES:
                     if claude_was_running and not claude_running_now:
                         self.logger.warning("⚠️  Claude Code process has exited unexpectedly")
                         print("\n⚠️  Warning: Claude Code has stopped running\n")
+                        print("claude> ", end='', flush=True)  # 重新显示提示符
                     claude_was_running = claude_running_now
 
                 time.sleep(0.5)
