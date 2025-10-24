@@ -59,6 +59,9 @@ class CLIAgent:
         try:
             # 首先检查命令是否存在
             import shutil
+            import struct
+            import termios
+
             if not shutil.which(self.cli_command):
                 self.logger.error(f"❌ Command '{self.cli_command}' not found in PATH")
                 self.logger.info(f"   Skipping {self.name} agent")
@@ -69,6 +72,10 @@ class CLIAgent:
 
             if self.pid == 0:
                 # 子进程：执行 CLI 命令
+                # 设置环境变量以提供更好的终端支持
+                os.environ['TERM'] = 'xterm-256color'
+                os.environ['COLORTERM'] = 'truecolor'
+
                 try:
                     os.execvp(self.cli_command, [self.cli_command])
                 except Exception as e:
@@ -76,6 +83,13 @@ class CLIAgent:
                     sys.exit(1)
 
             # 父进程：配置 PTY
+            # 设置终端尺寸（避免显示问题）
+            try:
+                winsize = struct.pack('HHHH', 24, 80, 0, 0)  # 24 行，80 列
+                fcntl.ioctl(self.fd, termios.TIOCSWINSZ, winsize)
+            except Exception as e:
+                self.logger.debug(f"Could not set terminal size: {e}")
+
             # 设置非阻塞模式
             fcntl.fcntl(self.fd, fcntl.F_SETFL, os.O_NONBLOCK)
 
@@ -83,11 +97,11 @@ class CLIAgent:
             self.stdout_fd = self.fd
 
             # 等待一下让进程初始化
-            time.sleep(0.3)
+            time.sleep(0.5)
 
-            # 尝试读取初始输出（可能包含错误信息）
+            # 尝试读取初始输出（可能包含欢迎信息和错误）
             initial_output = ""
-            max_read_attempts = 5
+            max_read_attempts = 10  # 增加尝试次数以读取完整的欢迎信息
             for attempt in range(max_read_attempts):
                 try:
                     chunk = os.read(self.fd, 4096)
@@ -99,7 +113,8 @@ class CLIAgent:
                         self.logger.debug(f"{self.name}: PTY closed during startup")
                         break
                     elif e.errno in (11, 35):  # EAGAIN/EWOULDBLOCK
-                        break  # 没有更多数据
+                        # 没有更多数据，但继续尝试一会儿
+                        pass
                 time.sleep(0.1)
 
             # 再等待一下，确保进程稳定
@@ -124,9 +139,12 @@ class CLIAgent:
             self.process_running = True
             self.logger.info(f"✅ Started {self.name} (PID: {self.pid})")
 
-            # 如果有初始输出，记录一下
+            # 如果有初始输出，记录一下（但过滤 ANSI 转义序列以便阅读）
             if initial_output:
-                self.logger.debug(f"{self.name} initial output: {initial_output[:100]}")
+                # 简单过滤 ANSI 转义序列用于日志
+                import re
+                clean_output = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', initial_output)
+                self.logger.debug(f"{self.name} initial output: {clean_output[:200]}")
 
             return True
 
