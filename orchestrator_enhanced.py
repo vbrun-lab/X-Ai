@@ -286,11 +286,14 @@ class CLIAgent:
                         if e.errno in (11, 35):  # EAGAIN, EWOULDBLOCK
                             continue
                         # EIO (errno 5) 通常意味着 PTY slave 已关闭（进程退出）
+                        # 但也可能是暂时的，所以需要验证进程状态
                         elif e.errno == 5:
-                            if not self.pty_closed:
-                                self.logger.debug(f"{self.name}: PTY closed (process likely exited)")
-                                self.pty_closed = True
-                                self.process_running = False
+                            # 只有在进程真的退出时才报告
+                            if not self.is_running():
+                                if not self.pty_closed:
+                                    self.logger.debug(f"{self.name}: PTY closed (process exited)")
+                                    self.pty_closed = True
+                                    self.process_running = False
                             break
                         else:
                             self.logger.debug(f"Error reading from {self.name}: {e}")
