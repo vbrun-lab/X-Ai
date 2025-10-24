@@ -64,36 +64,57 @@ class CLIAgent:
                 self.logger.info(f"   Skipping {self.name} agent")
                 return False
 
-            # 启动子进程
-            process = subprocess.Popen(
-                [self.cli_command],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                bufsize=0,
-                preexec_fn=os.setsid,  # 新进程组
-                universal_newlines=False
-            )
+            # 使用 PTY fork 创建真正的伪终端
+            self.pid, self.fd = pty.fork()
 
-            self.pid = process.pid
-            self.process = process  # 保存 process 对象
-            self.fd = process.stdin.fileno() if process.stdin else None
-            self.stdout_fd = process.stdout.fileno() if process.stdout else None
+            if self.pid == 0:
+                # 子进程：执行 CLI 命令
+                try:
+                    os.execvp(self.cli_command, [self.cli_command])
+                except Exception as e:
+                    sys.stderr.write(f"Failed to exec {self.cli_command}: {e}\n")
+                    sys.exit(1)
 
+            # 父进程：配置 PTY
             # 设置非阻塞模式
-            if self.stdout_fd:
-                fcntl.fcntl(self.stdout_fd, fcntl.F_SETFL, os.O_NONBLOCK)
+            fcntl.fcntl(self.fd, fcntl.F_SETFL, os.O_NONBLOCK)
+
+            # 保存 stdout_fd 以便后续读取
+            self.stdout_fd = self.fd
 
             # 等待一下确保进程真的启动了
-            time.sleep(0.3)
+            time.sleep(0.5)
+
+            # 尝试读取初始输出（可能包含错误信息）
+            initial_output = ""
+            try:
+                initial_output = os.read(self.fd, 4096).decode('utf-8', errors='replace')
+                self.output_buffer += initial_output
+            except OSError:
+                pass  # 可能还没有输出
 
             # 检查进程是否立即退出
-            if process.poll() is not None:
-                self.logger.error(f"❌ {self.name} exited immediately with code {process.returncode}")
-                return False
+            try:
+                pid_result, status = os.waitpid(self.pid, os.WNOHANG)
+                if pid_result != 0:
+                    # 进程已退出
+                    exit_code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else -1
+                    self.logger.error(f"❌ {self.name} exited immediately with code {exit_code}")
+
+                    # 显示可能的错误信息
+                    if initial_output:
+                        self.logger.error(f"   Output: {initial_output[:200]}")
+
+                    return False
+            except OSError:
+                pass  # 进程仍在运行
 
             self.process_running = True
             self.logger.info(f"✅ Started {self.name} (PID: {self.pid})")
+
+            # 如果有初始输出，记录一下
+            if initial_output:
+                self.logger.debug(f"{self.name} initial output: {initial_output[:100]}")
 
             return True
 
@@ -541,49 +562,71 @@ NOTES:
 def main():
     """主函数"""
     import argparse
-    
+
     parser = argparse.ArgumentParser(
         description="AI Orchestrator - Codex driving Claude Code",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   python3 orchestrator_enhanced.py
-  
+  python3 orchestrator_enhanced.py --debug   # Enable debug logging
+
 Notes:
   - Make sure codex and claude CLIs are installed
   - All interactions are logged to orchestrator.log
   - Architecture is extensible for future AI additions
         """
     )
-    
+
+    parser.add_argument(
+        '--debug',
+        action='store_true',
+        help='Enable debug logging for detailed output'
+    )
+
     args = parser.parse_args()
-    
+
+    # 如果启用 debug，更新日志级别
+    if args.debug:
+        for handler in logging.root.handlers[:]:
+            logging.root.removeHandler(handler)
+
+        logging.basicConfig(
+            level=logging.DEBUG,
+            format='[%(asctime)s] %(name)s: %(message)s',
+            handlers=[
+                logging.StreamHandler(),
+                logging.FileHandler('orchestrator.log')
+            ]
+        )
+        logger.info("🔍 Debug mode enabled")
+
     # 创建主控器
     orchestrator = Orchestrator()
-    
+
     # 注册 Agent（为未来添加更多 AI 预留接口）
     orchestrator.register_agent("codex", "codex")
     orchestrator.register_agent("claude-code", "claude")
-    
+
     logger.info("Starting AI Orchestrator (MVP)")
-    
+
     # 启动所有 Agent
     if not orchestrator.start_all():
         logger.error("Failed to start agents")
         sys.exit(1)
-    
+
     # 运行交互式会话
     try:
         session = InteractiveSession(orchestrator)
         session.run()
-    
+
     except RuntimeError as e:
         logger.error(f"Session error: {e}")
         sys.exit(1)
     except Exception as e:
         logger.error(f"Unexpected error: {e}", exc_info=True)
         sys.exit(1)
-    
+
     finally:
         orchestrator.shutdown()
 
