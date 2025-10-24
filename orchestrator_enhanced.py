@@ -19,7 +19,7 @@ import select
 import fcntl
 import subprocess
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 import logging
 import threading
 
@@ -244,8 +244,19 @@ class CLIAgent:
 
         try:
             # 发送命令 + Enter
-            cmd_bytes = (command + '\n').encode('utf-8')
-            os.write(self.fd, cmd_bytes)
+            cmd_bytes = command.encode('utf-8')
+            if cmd_bytes:
+                os.write(self.fd, cmd_bytes)
+
+            # Claude / Gemini 等 CLI 需要先发送 C-j (LF) 再发送 C-m (CR) 才会触发执行
+            requires_crlf = self.cli_command in {'claude', 'gemini'}
+
+            if requires_crlf:
+                os.write(self.fd, b'\n')  # C-j
+                time.sleep(0.05)         # 短暂等待，模拟连续按键
+                os.write(self.fd, b'\r') # C-m
+            else:
+                os.write(self.fd, b'\n')
 
             self.logger.debug(f"→ {self.name}: {command[:60]}")
             return True
@@ -309,11 +320,19 @@ class CLIAgent:
         except Exception as e:
             self.logger.debug(f"Error reading from {self.name}: {e}")
 
-        # 过滤 ANSI 转义序列以便更清晰地阅读
+        # 过滤 ANSI 和 OSC 转义序列以便更清晰地阅读
         if output:
             import re
-            # 保留可打印字符和换行符，删除 ANSI 转义序列
-            output = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', output)
+            # 移除大多数 CSI 序列（含扩展模式）
+            output = re.sub(r'\x1b\[[0-9;?]*[ -/]*[@-~]', '', output)
+            # 移除 OSC 序列（超链接、标题等），支持 BEL 或 ST 结尾
+            output = re.sub(r'\x1b\][^\x07\x1b]*(\x07|\x1b\\)', '', output)
+            # 移除单字符转义序列（G0/G1 选择等）
+            output = re.sub(r'\x1b[()][0-9A-Za-z]', '', output)
+            # 移除其他孤立的 ESC 控制
+            output = output.replace('\x1b=', '').replace('\x1b>', '')
+            # 统一回车符
+            output = output.replace('\r\n', '\n').replace('\r', '\n')
 
         return output
     
@@ -727,6 +746,77 @@ NOTES:
         else:
             print(f"Unknown command: {cmd}")
     
+    def _clean_output_lines(self, command: str, lines: List[str], agent_label: str) -> List[str]:
+        """过滤掉 CLI UI 噪声，只保留有效内容"""
+        cleaned: List[str] = []
+        seen: set = set()
+
+        # 常见噪声关键词（大小写不敏感匹配）
+        noise_keywords = [
+            "? for shortcuts",
+            "thinking on",
+            "approaching weekly limit",
+            "ctrl-g to edit prompt in vi",
+            "ctrl+o to show thinking",
+            "billowing…",
+            "marinating…",
+            "thinking…",
+            "∙ billowing",
+            "∙ marinating",
+            "thought for",
+            "esc to interrupt",
+            "tab to toggle",
+            "weekly limit",
+            "token",
+            "bonjour claude",  # placeholder, keep optional
+        ]
+
+        for raw_line in lines:
+            if not raw_line:
+                continue
+
+            # 统一空白字符并剥离前后空格
+            normalized = raw_line.replace('\xa0', ' ').strip()
+            if not normalized:
+                continue
+
+            lower_line = normalized.lower()
+
+            # 跳过命令回显和提示符
+            if normalized == command:
+                continue
+            if normalized in {'>', f'{agent_label}>'}:
+                continue
+            if normalized.startswith(f'{agent_label}>'):
+                tail = normalized[len(agent_label) + 1 :].strip()
+                if not tail or tail == command:
+                    continue
+                normalized = tail
+                lower_line = normalized.lower()
+
+            if normalized.startswith('>'):
+                # 处理 > command 或者 >  command 变体
+                remaining = normalized[1:].strip()
+                if remaining == command or not remaining:
+                    continue
+
+            # 跳过由装饰字符组成的分割线
+            if all(ch in {'─', '─', ' ', '-', '·', '—'} for ch in normalized):
+                continue
+
+            # 跳过噪声关键字
+            if any(keyword in lower_line for keyword in noise_keywords):
+                continue
+
+            # 避免重复行
+            if normalized in seen:
+                continue
+
+            seen.add(normalized)
+            cleaned.append(normalized)
+
+        return cleaned
+
     def _send_to_claude1(self, command: str):
         """向 Claude-1 发送命令并显示响应"""
         if not self.claude1 or not self.claude1.is_running():
@@ -744,33 +834,47 @@ NOTES:
 
         # 读取 Claude-1 的输出
         output = ""
-        max_wait = 9  # 最多等待约 20 秒（2秒初始 + 9次 * 2秒）
-        for i in range(max_wait):
-            chunk = self.claude1.read_output(timeout=3.0)
-            if chunk:
-                self.logger.debug(f"Received chunk {i+1}: {len(chunk)} bytes")
-                output += chunk
-                # 如果收到内容，继续读取一段时间以确保获取完整响应
-                if i < max_wait - 1:
-                    time.sleep(0.5)
-            else:
-                # 如果已经有输出且连续没有新内容，停止等待
-                if output.strip():
-                    self.logger.debug(f"No more content after {i+1} attempts, stopping")
-                    break
-                time.sleep(2.0)
+        deadline = time.time() + 45.0  # 最多等待约 45 秒
+        idle_checks = 0
+        max_idle_checks = 3  # 允许多次空读，以适应慢速流式响应
+        attempt = 0
 
-        self.logger.debug(f"Total output received: {len(output)} bytes")
+        while time.time() < deadline and idle_checks < max_idle_checks:
+            attempt += 1
+            chunk = self.claude1.read_output(timeout=3.0)
+
+            if chunk:
+                self.logger.debug(f"Received chunk {attempt}: {len(chunk)} bytes")
+                output += chunk
+                idle_checks = 0  # 有新内容，重置空读计数
+                time.sleep(0.5)
+            else:
+                idle_checks += 1
+                # 初次读取不到内容，等待更久；后续空读采用较短等待
+                sleep_time = 2.0 if not output.strip() else 1.0
+                self.logger.debug(
+                    f"No new content on attempt {attempt} "
+                    f"(idle {idle_checks}/{max_idle_checks})"
+                )
+                time.sleep(sleep_time)
+
+        self.logger.debug(
+            f"Total output received: {len(output)} bytes; "
+            f"idle_checks={idle_checks}"
+        )
 
         if output.strip():
-            # 过滤回显和提示符
-            lines = output.strip().split('\n')
-            for line in lines:
-                line = line.strip()
-                if line and not line.startswith('claude1>'):
+            normalized = output.replace('\r\n', '\n').replace('\r', '\n')
+            lines = normalized.split('\n')
+            cleaned_lines = self._clean_output_lines(command, lines, 'claude1')
+
+            if cleaned_lines:
+                for line in cleaned_lines:
                     print(line)
+            else:
+                print("⚠️  Claude-1 produced output that could not be parsed.")
         else:
-            print("⚠️  No response from Claude-1 (timeout after 20s)")
+            print("⚠️  No response from Claude-1 (timeout or rate limit)")
     
     def _send_to_claude2(self, command: str):
         """从 Claude-1 向 Claude-2 发送命令"""
@@ -789,35 +893,49 @@ NOTES:
 
         # 读取 Claude-2 的输出
         output = ""
-        max_wait = 9  # 最多等待约 20 秒（2秒初始 + 9次 * 2秒）
-        for i in range(max_wait):
-            chunk = self.claude2.read_output(timeout=3.0)
-            if chunk:
-                self.logger.debug(f"Received Claude chunk {i+1}: {len(chunk)} bytes")
-                output += chunk
-                # 如果收到内容，继续读取一段时间以确保获取完整响应
-                if i < max_wait - 1:
-                    time.sleep(0.5)
-            else:
-                # 如果已经有输出且连续没有新内容，停止等待
-                if output.strip():
-                    self.logger.debug(f"No more Claude content after {i+1} attempts, stopping")
-                    break
-                time.sleep(2.0)
+        deadline = time.time() + 45.0  # 最多等待约 45 秒
+        idle_checks = 0
+        max_idle_checks = 3
+        attempt = 0
 
-        self.logger.debug(f"Total Claude output received: {len(output)} bytes")
+        while time.time() < deadline and idle_checks < max_idle_checks:
+            attempt += 1
+            chunk = self.claude2.read_output(timeout=3.0)
+
+            if chunk:
+                self.logger.debug(f"Received Claude chunk {attempt}: {len(chunk)} bytes")
+                output += chunk
+                idle_checks = 0
+                time.sleep(0.5)
+            else:
+                idle_checks += 1
+                sleep_time = 2.0 if not output.strip() else 1.0
+                self.logger.debug(
+                    f"No more Claude content on attempt {attempt} "
+                    f"(idle {idle_checks}/{max_idle_checks})"
+                )
+                time.sleep(sleep_time)
+
+        self.logger.debug(
+            f"Total Claude output received: {len(output)} bytes; "
+            f"idle_checks={idle_checks}"
+        )
 
         if output.strip():
-            print("\n🔵 Claude-2 Output:")
-            print("-" * 50)
-            # 只显示关键行
-            lines = output.strip().split('\n')
-            for line in lines[-20:]:  # 显示最后 20 行
-                if line.strip():
+            normalized = output.replace('\r\n', '\n').replace('\r', '\n')
+            lines = normalized.split('\n')
+            filtered = self._clean_output_lines(command, lines, 'claude2')
+
+            if filtered:
+                print("\n🔵 Claude-2 Output:")
+                print("-" * 50)
+                for line in filtered[-20:]:
                     print(line)
-            print("-" * 50)
+                print("-" * 50)
+            else:
+                print("⚠️  Claude-2 produced output that could not be parsed.")
         else:
-            print("⚠️  No response from Claude-2 (timeout after 20s)")
+            print("⚠️  No response from Claude-2 (timeout or rate limit)")
 
         if self.claude1:
             print("\n继续 Claude-1 会话...\n")
