@@ -39,12 +39,19 @@ echo -e "${GREEN}✓ 所有依赖已安装${NC}\n"
 # 启动程序
 echo -e "${YELLOW}启动 Orchestrator...${NC}\n"
 
+# 检查 debug 参数
+DEBUG_FLAG=""
+if [ "$1" == "--debug" ] || [ "$2" == "--debug" ]; then
+    DEBUG_FLAG="--debug"
+    echo -e "${YELLOW}🔍 Debug mode enabled${NC}\n"
+fi
+
 # 选择版本
 if [ "$1" == "simple" ]; then
     echo -e "${GREEN}使用基础版本 (minimal_orchestrator.py)${NC}\n"
-    python3 minimal_orchestrator.py
+    python3 minimal_orchestrator.py $DEBUG_FLAG
 else
     echo -e "${GREEN}使用增强版本 (orchestrator_enhanced.py)${NC}"
     echo -e "  支持: > claude [command] 语法\n"
-    python3 orchestrator_enhanced.py
+    python3 orchestrator_enhanced.py $DEBUG_FLAG
 fi

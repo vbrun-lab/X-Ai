@@ -46,11 +46,12 @@ class CLIAgent:
         """
         self.name = name
         self.cli_command = cli_command
-        
+
         self.pid: Optional[int] = None
         self.fd: Optional[int] = None  # PTY master fd
         self.process_running = False
-        
+        self.pty_closed = False  # 跟踪 PTY 是否已关闭
+
         self.logger = logging.getLogger(f'agent.{name}')
         self.output_buffer = ""  # 缓存输出
     
@@ -59,41 +60,133 @@ class CLIAgent:
         try:
             # 首先检查命令是否存在
             import shutil
+            import struct
+            import termios
+
             if not shutil.which(self.cli_command):
                 self.logger.error(f"❌ Command '{self.cli_command}' not found in PATH")
                 self.logger.info(f"   Skipping {self.name} agent")
                 return False
 
-            # 启动子进程
-            process = subprocess.Popen(
-                [self.cli_command],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                bufsize=0,
-                preexec_fn=os.setsid,  # 新进程组
-                universal_newlines=False
-            )
+            # 使用 PTY fork 创建真正的伪终端
+            self.pid, self.fd = pty.fork()
 
-            self.pid = process.pid
-            self.process = process  # 保存 process 对象
-            self.fd = process.stdin.fileno() if process.stdin else None
-            self.stdout_fd = process.stdout.fileno() if process.stdout else None
+            if self.pid == 0:
+                # 子进程：执行 CLI 命令
+                # 设置环境变量以提供更好的终端支持
+                os.environ['TERM'] = 'xterm-256color'
+                os.environ['COLORTERM'] = 'truecolor'
+
+                try:
+                    os.execvp(self.cli_command, [self.cli_command])
+                except Exception as e:
+                    sys.stderr.write(f"Failed to exec {self.cli_command}: {e}\n")
+                    sys.exit(1)
+
+            # 父进程：配置 PTY
+            # 设置终端尺寸（避免显示问题）
+            try:
+                winsize = struct.pack('HHHH', 24, 80, 0, 0)  # 24 行，80 列
+                fcntl.ioctl(self.fd, termios.TIOCSWINSZ, winsize)
+            except Exception as e:
+                self.logger.debug(f"Could not set terminal size: {e}")
 
             # 设置非阻塞模式
-            if self.stdout_fd:
-                fcntl.fcntl(self.stdout_fd, fcntl.F_SETFL, os.O_NONBLOCK)
+            fcntl.fcntl(self.fd, fcntl.F_SETFL, os.O_NONBLOCK)
 
-            # 等待一下确保进程真的启动了
-            time.sleep(0.3)
+            # 保存 stdout_fd 以便后续读取
+            self.stdout_fd = self.fd
+
+            # 等待一下让进程初始化
+            time.sleep(0.5)
+
+            # 尝试读取初始输出（可能包含欢迎信息和错误）
+            initial_output = ""
+            max_read_attempts = 10  # 增加尝试次数以读取完整的欢迎信息
+            for attempt in range(max_read_attempts):
+                try:
+                    chunk = os.read(self.fd, 4096)
+                    if chunk:
+                        initial_output += chunk.decode('utf-8', errors='replace')
+                        self.output_buffer += chunk.decode('utf-8', errors='replace')
+                except OSError as e:
+                    if e.errno == 5:  # EIO - PTY 已关闭
+                        self.logger.debug(f"{self.name}: PTY closed during startup")
+                        break
+                    elif e.errno in (11, 35):  # EAGAIN/EWOULDBLOCK
+                        # 没有更多数据，但继续尝试一会儿
+                        pass
+                time.sleep(0.1)
+
+            # 再等待一下，确保进程稳定
+            time.sleep(0.5)
 
             # 检查进程是否立即退出
-            if process.poll() is not None:
-                self.logger.error(f"❌ {self.name} exited immediately with code {process.returncode}")
-                return False
+            try:
+                pid_result, status = os.waitpid(self.pid, os.WNOHANG)
+                if pid_result != 0:
+                    # 进程已退出
+                    exit_code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else -1
+                    self.logger.error(f"❌ {self.name} exited immediately with code {exit_code}")
+
+                    # 显示可能的错误信息
+                    if initial_output:
+                        self.logger.error(f"   Output: {initial_output[:500]}")
+
+                    return False
+            except OSError:
+                pass  # 进程仍在运行
+
+            # 如果没有实质性的初始输出，可能需要发送一个输入来激活进程
+            # 检查是否有有意义的内容（过滤掉 ANSI 转义序列后）
+            import re
+            clean_output = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', initial_output)
+            meaningful_content = clean_output.strip()
+
+            # 如果没有实质内容，或者看起来只是 ANSI 序列，发送换行来激活
+            should_send_newline = (
+                not initial_output or
+                len(meaningful_content) < 10 or
+                # 对于 codex，总是尝试发送换行（它可能需要交互）
+                self.cli_command == 'codex'
+            )
+
+            if should_send_newline:
+                self.logger.debug(f"{self.name}: Sending initial newline to activate CLI")
+                try:
+                    # 发送一个换行符
+                    os.write(self.fd, b'\n')
+                    time.sleep(0.3)
+
+                    # 尝试读取响应
+                    try:
+                        response = os.read(self.fd, 4096)
+                        if response:
+                            decoded = response.decode('utf-8', errors='replace')
+                            initial_output += decoded
+                            self.output_buffer += decoded
+                            self.logger.debug(f"{self.name}: Got response after newline: {len(decoded)} bytes")
+                    except OSError as e:
+                        if e.errno == 5:  # EIO
+                            self.logger.error(f"❌ {self.name}: PTY closed after sending newline")
+                            # 再次检查进程状态
+                            pid_result, status = os.waitpid(self.pid, os.WNOHANG)
+                            if pid_result != 0:
+                                exit_code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else -1
+                                self.logger.error(f"   Process exited with code {exit_code}")
+                            return False
+                except OSError as e:
+                    self.logger.debug(f"{self.name}: Could not send initial newline: {e}")
 
             self.process_running = True
             self.logger.info(f"✅ Started {self.name} (PID: {self.pid})")
+
+            # 如果有初始输出，记录一下（但过滤 ANSI 转义序列以便阅读）
+            if initial_output:
+                # clean_output 已经在上面定义了
+                self.logger.debug(f"{self.name} initial output: {meaningful_content[:200]}")
+            else:
+                self.logger.warning(f"{self.name}: No initial output received (may be normal)")
 
             return True
 
@@ -108,56 +201,77 @@ class CLIAgent:
     
     def send_command(self, command: str) -> bool:
         """向 Agent 发送命令"""
-        if not self.process_running or self.fd is None:
+        if self.fd is None:
+            self.logger.warning(f"Cannot send command: {self.name} not initialized")
+            return False
+
+        # 检查进程是否还在运行
+        if not self.is_running():
             self.logger.warning(f"Cannot send command: {self.name} not running")
             return False
-        
+
         try:
             # 发送命令 + Enter
             cmd_bytes = (command + '\n').encode('utf-8')
             os.write(self.fd, cmd_bytes)
-            
+
             self.logger.debug(f"→ {self.name}: {command[:60]}")
             return True
-        
+
         except Exception as e:
             self.logger.error(f"Error sending command to {self.name}: {e}")
             return False
     
     def read_output(self, timeout: float = 0.2) -> str:
         """从 Agent 读取输出"""
-        if not self.process_running or not self.stdout_fd:
+        if not self.stdout_fd:
             return ""
-        
+
+        # 如果 PTY 已关闭，不要尝试读取
+        if self.pty_closed:
+            return ""
+
+        # 首先检查进程是否还在运行
+        if not self.is_running():
+            return ""
+
         output = ""
         start_time = time.time()
-        
+
         try:
             while time.time() - start_time < timeout:
                 # 使用 select 等待数据可读
                 ready, _, _ = select.select([self.stdout_fd], [], [], 0.05)
-                
+
                 if ready:
                     try:
                         chunk = os.read(self.stdout_fd, 4096)
                         if chunk:
                             output += chunk.decode('utf-8', errors='replace')
-                        else:
-                            # EOF - 进程已结束
-                            self.process_running = False
-                            break
+                        # 不要在这里设置 process_running = False
+                        # 空 chunk 不一定意味着进程退出
                     except OSError as e:
-                        if e.errno != 11:  # EAGAIN
-                            self.process_running = False
+                        # EAGAIN/EWOULDBLOCK 是正常的非阻塞错误
+                        if e.errno in (11, 35):  # EAGAIN, EWOULDBLOCK
+                            continue
+                        # EIO (errno 5) 通常意味着 PTY slave 已关闭（进程退出）
+                        elif e.errno == 5:
+                            if not self.pty_closed:
+                                self.logger.debug(f"{self.name}: PTY closed (process likely exited)")
+                                self.pty_closed = True
+                                self.process_running = False
+                            break
+                        else:
+                            self.logger.debug(f"Error reading from {self.name}: {e}")
                         break
-        
+
         except Exception as e:
             self.logger.debug(f"Error reading from {self.name}: {e}")
-        
+
         # 更新缓冲区
         if output:
             self.output_buffer += output
-        
+
         return output
     
     def is_running(self) -> bool:
@@ -355,14 +469,81 @@ NOTES:
         print(help_text)
     
     def _start_monitoring(self):
-        """启动后台监听线程（监控输出）"""
+        """启动后台监听线程（监控输出和进程状态）"""
+        # 跟踪已知的进程状态
+        codex_was_running = self.codex and self.codex.is_running()
+        claude_was_running = self.claude and self.claude.is_running()
+
         def monitor():
+            nonlocal codex_was_running, claude_was_running
+
             while self.monitoring and self.orchestrator.running:
-                # 定期读取 Codex 的输出（用于日志）
-                if self.codex and self.codex.is_running():
-                    output = self.codex.read_output(timeout=0.1)
-                    if output and "[BACKGROUND]" in output:
-                        self.logger.info(f"Codex background: {output[:100]}")
+                # 检查 Codex 状态变化
+                if self.codex and self.codex.pid:
+                    codex_running_now = self.codex.is_running()
+                    if codex_was_running and not codex_running_now:
+                        # 尝试获取退出状态
+                        try:
+                            pid_result, status = os.waitpid(self.codex.pid, os.WNOHANG)
+                            if pid_result != 0:
+                                if os.WIFEXITED(status):
+                                    exit_code = os.WEXITSTATUS(status)
+                                    self.logger.warning(f"⚠️  Codex exited with code {exit_code}")
+                                    print(f"\n⚠️  Warning: Codex exited with code {exit_code}\n")
+                                elif os.WIFSIGNALED(status):
+                                    signal_num = os.WTERMSIG(status)
+                                    self.logger.warning(f"⚠️  Codex killed by signal {signal_num}")
+                                    print(f"\n⚠️  Warning: Codex killed by signal {signal_num}\n")
+                                else:
+                                    self.logger.warning("⚠️  Codex exited unexpectedly")
+                                    print("\n⚠️  Warning: Codex exited unexpectedly\n")
+                            else:
+                                self.logger.warning("⚠️  Codex stopped running")
+                                print("\n⚠️  Warning: Codex stopped running\n")
+                        except (OSError, ChildProcessError):
+                            self.logger.warning("⚠️  Codex stopped running")
+                            print("\n⚠️  Warning: Codex stopped running\n")
+
+                        print("codex> ", end='', flush=True)  # 重新显示提示符
+                    codex_was_running = codex_running_now
+
+                    # 只在进程运行时读取输出
+                    if codex_running_now:
+                        try:
+                            output = self.codex.read_output(timeout=0.1)
+                            if output and "[BACKGROUND]" in output:
+                                self.logger.info(f"Codex background: {output[:100]}")
+                        except Exception as e:
+                            self.logger.debug(f"Error in monitor reading codex: {e}")
+
+                # 检查 Claude Code 状态变化
+                if self.claude and self.claude.pid:
+                    claude_running_now = self.claude.is_running()
+                    if claude_was_running and not claude_running_now:
+                        # 尝试获取退出状态
+                        try:
+                            pid_result, status = os.waitpid(self.claude.pid, os.WNOHANG)
+                            if pid_result != 0:
+                                if os.WIFEXITED(status):
+                                    exit_code = os.WEXITSTATUS(status)
+                                    self.logger.warning(f"⚠️  Claude Code exited with code {exit_code}")
+                                    print(f"\n⚠️  Warning: Claude Code exited with code {exit_code}\n")
+                                elif os.WIFSIGNALED(status):
+                                    signal_num = os.WTERMSIG(status)
+                                    self.logger.warning(f"⚠️  Claude Code killed by signal {signal_num}")
+                                    print(f"\n⚠️  Warning: Claude Code killed by signal {signal_num}\n")
+                                else:
+                                    self.logger.warning("⚠️  Claude Code exited unexpectedly")
+                                    print("\n⚠️  Warning: Claude Code exited unexpectedly\n")
+                            else:
+                                self.logger.warning("⚠️  Claude Code stopped running")
+                                print("\n⚠️  Warning: Claude Code stopped running\n")
+                        except (OSError, ChildProcessError):
+                            self.logger.warning("⚠️  Claude Code stopped running")
+                            print("\n⚠️  Warning: Claude Code stopped running\n")
+
+                        print("claude> ", end='', flush=True)  # 重新显示提示符
+                    claude_was_running = claude_running_now
 
                 time.sleep(0.5)
 
@@ -541,49 +722,71 @@ NOTES:
 def main():
     """主函数"""
     import argparse
-    
+
     parser = argparse.ArgumentParser(
         description="AI Orchestrator - Codex driving Claude Code",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   python3 orchestrator_enhanced.py
-  
+  python3 orchestrator_enhanced.py --debug   # Enable debug logging
+
 Notes:
   - Make sure codex and claude CLIs are installed
   - All interactions are logged to orchestrator.log
   - Architecture is extensible for future AI additions
         """
     )
-    
+
+    parser.add_argument(
+        '--debug',
+        action='store_true',
+        help='Enable debug logging for detailed output'
+    )
+
     args = parser.parse_args()
-    
+
+    # 如果启用 debug，更新日志级别
+    if args.debug:
+        for handler in logging.root.handlers[:]:
+            logging.root.removeHandler(handler)
+
+        logging.basicConfig(
+            level=logging.DEBUG,
+            format='[%(asctime)s] %(name)s: %(message)s',
+            handlers=[
+                logging.StreamHandler(),
+                logging.FileHandler('orchestrator.log')
+            ]
+        )
+        logger.info("🔍 Debug mode enabled")
+
     # 创建主控器
     orchestrator = Orchestrator()
-    
+
     # 注册 Agent（为未来添加更多 AI 预留接口）
     orchestrator.register_agent("codex", "codex")
     orchestrator.register_agent("claude-code", "claude")
-    
+
     logger.info("Starting AI Orchestrator (MVP)")
-    
+
     # 启动所有 Agent
     if not orchestrator.start_all():
         logger.error("Failed to start agents")
         sys.exit(1)
-    
+
     # 运行交互式会话
     try:
         session = InteractiveSession(orchestrator)
         session.run()
-    
+
     except RuntimeError as e:
         logger.error(f"Session error: {e}")
         sys.exit(1)
     except Exception as e:
         logger.error(f"Unexpected error: {e}", exc_info=True)
         sys.exit(1)
-    
+
     finally:
         orchestrator.shutdown()
 
