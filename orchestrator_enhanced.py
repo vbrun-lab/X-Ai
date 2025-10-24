@@ -54,6 +54,7 @@ class CLIAgent:
 
         self.logger = logging.getLogger(f'agent.{name}')
         self.output_buffer = ""  # 缓存输出
+        self.buffer_lock = threading.Lock()  # 保护 output_buffer 的线程锁
 
         # 心跳机制（用于保持 codex 活跃）
         self.heartbeat_thread: Optional[threading.Thread] = None
@@ -258,15 +259,20 @@ class CLIAgent:
         if not self.stdout_fd:
             return ""
 
-        # 如果 PTY 已关闭，不要尝试读取
+        # 首先从 output_buffer 获取已有内容（可能是心跳线程读取的）
+        with self.buffer_lock:
+            output = self.output_buffer
+            self.output_buffer = ""  # 清空 buffer
+
+        # 如果 PTY 已关闭，只返回 buffer 中剩余的内容
         if self.pty_closed:
-            return ""
+            return output
 
-        # 首先检查进程是否还在运行
+        # 检查进程是否还在运行
         if not self.is_running():
-            return ""
+            return output
 
-        output = ""
+        # 然后尝试从文件描述符读取新内容
         start_time = time.time()
 
         try:
@@ -278,7 +284,8 @@ class CLIAgent:
                     try:
                         chunk = os.read(self.stdout_fd, 4096)
                         if chunk:
-                            output += chunk.decode('utf-8', errors='replace')
+                            decoded = chunk.decode('utf-8', errors='replace')
+                            output += decoded
                         # 不要在这里设置 process_running = False
                         # 空 chunk 不一定意味着进程退出
                     except OSError as e:
@@ -302,9 +309,11 @@ class CLIAgent:
         except Exception as e:
             self.logger.debug(f"Error reading from {self.name}: {e}")
 
-        # 更新缓冲区
+        # 过滤 ANSI 转义序列以便更清晰地阅读
         if output:
-            self.output_buffer += output
+            import re
+            # 保留可打印字符和换行符，删除 ANSI 转义序列
+            output = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', output)
 
         return output
     
@@ -342,7 +351,8 @@ class CLIAgent:
                             try:
                                 response = os.read(self.fd, 4096)
                                 if response:
-                                    self.output_buffer += response.decode('utf-8', errors='replace')
+                                    with self.buffer_lock:
+                                        self.output_buffer += response.decode('utf-8', errors='replace')
                             except OSError:
                                 pass  # 忽略读取错误
 
