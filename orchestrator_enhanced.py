@@ -640,7 +640,7 @@ NOTES:
                         print("claude> ", end='', flush=True)  # 重新显示提示符
                     claude_was_running = claude_running_now
 
-                time.sleep(0.5)
+                time.sleep(3.0)  # 监控间隔（3秒足够检测进程退出）
 
         self.monitor_thread = threading.Thread(target=monitor, daemon=True)
         self.monitor_thread.start()
