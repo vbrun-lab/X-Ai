@@ -57,6 +57,13 @@ class CLIAgent:
     def start(self) -> bool:
         """启动 CLI 进程在 PTY 中"""
         try:
+            # 首先检查命令是否存在
+            import shutil
+            if not shutil.which(self.cli_command):
+                self.logger.error(f"❌ Command '{self.cli_command}' not found in PATH")
+                self.logger.info(f"   Skipping {self.name} agent")
+                return False
+
             # 启动子进程
             process = subprocess.Popen(
                 [self.cli_command],
@@ -67,22 +74,36 @@ class CLIAgent:
                 preexec_fn=os.setsid,  # 新进程组
                 universal_newlines=False
             )
-            
+
             self.pid = process.pid
+            self.process = process  # 保存 process 对象
             self.fd = process.stdin.fileno() if process.stdin else None
             self.stdout_fd = process.stdout.fileno() if process.stdout else None
-            
+
             # 设置非阻塞模式
             if self.stdout_fd:
                 fcntl.fcntl(self.stdout_fd, fcntl.F_SETFL, os.O_NONBLOCK)
-            
+
+            # 等待一下确保进程真的启动了
+            time.sleep(0.3)
+
+            # 检查进程是否立即退出
+            if process.poll() is not None:
+                self.logger.error(f"❌ {self.name} exited immediately with code {process.returncode}")
+                return False
+
             self.process_running = True
             self.logger.info(f"✅ Started {self.name} (PID: {self.pid})")
-            
+
             return True
-        
+
+        except FileNotFoundError:
+            self.logger.error(f"❌ Command '{self.cli_command}' not found")
+            return False
         except Exception as e:
             self.logger.error(f"❌ Failed to start {self.name}: {e}")
+            import traceback
+            self.logger.debug(traceback.format_exc())
             return False
     
     def send_command(self, command: str) -> bool:
@@ -213,18 +234,32 @@ class Orchestrator:
     def start_all(self) -> bool:
         """启动所有 Agent"""
         self.logger.info("Starting all agents...")
-        
+
+        success_count = 0
+        failed_agents = []
+
         for name, agent in self.agents.items():
-            if not agent.start():
-                self.logger.error(f"Failed to start {name}")
-                self.shutdown()
-                return False
-            
-            # 等待 Agent 启动
-            time.sleep(0.5)
-        
+            if agent.start():
+                success_count += 1
+                # 等待 Agent 启动
+                time.sleep(0.5)
+            else:
+                self.logger.warning(f"⚠️  Failed to start {name}")
+                failed_agents.append(name)
+
+        if success_count == 0:
+            self.logger.error("❌ No agents could be started")
+            self.shutdown()
+            return False
+
         self.running = True
-        self.logger.info("✅ All agents started")
+
+        if failed_agents:
+            self.logger.warning(f"⚠️  Some agents failed to start: {', '.join(failed_agents)}")
+            self.logger.info(f"✅ {success_count}/{len(self.agents)} agents started successfully")
+        else:
+            self.logger.info("✅ All agents started successfully")
+
         return True
     
     def get_agent(self, name: str) -> Optional[CLIAgent]:
@@ -262,12 +297,20 @@ class InteractiveSession:
         self.codex = orchestrator.get_agent("codex")
         self.claude = orchestrator.get_agent("claude-code")
         self.logger = logging.getLogger('session')
-        
-        if not self.codex:
-            raise RuntimeError("Codex agent not found")
-        if not self.claude:
-            raise RuntimeError("Claude Code agent not found")
-        
+
+        # 检查至少有一个 agent 可用
+        if not self.codex and not self.claude:
+            raise RuntimeError("No agents available")
+
+        # 检查 codex 是否真的在运行
+        if self.codex and not self.codex.is_running():
+            self.logger.warning("⚠️  Codex agent not running, will use Claude Code only")
+            self.codex = None
+
+        if not self.claude or not self.claude.is_running():
+            if not self.codex or not self.codex.is_running():
+                raise RuntimeError("No running agents available")
+
         # 监听线程
         self.monitor_thread = None
         self.monitoring = True
@@ -316,12 +359,13 @@ NOTES:
         def monitor():
             while self.monitoring and self.orchestrator.running:
                 # 定期读取 Codex 的输出（用于日志）
-                output = self.codex.read_output(timeout=0.1)
-                if output and "[BACKGROUND]" in output:
-                    self.logger.info(f"Codex background: {output[:100]}")
-                
+                if self.codex and self.codex.is_running():
+                    output = self.codex.read_output(timeout=0.1)
+                    if output and "[BACKGROUND]" in output:
+                        self.logger.info(f"Codex background: {output[:100]}")
+
                 time.sleep(0.5)
-        
+
         self.monitor_thread = threading.Thread(target=monitor, daemon=True)
         self.monitor_thread.start()
     
@@ -329,39 +373,57 @@ NOTES:
         """运行交互式会话"""
         print("\n" + "="*60)
         print("🤖 AI Orchestrator - MVP Version")
-        print("   Codex + Claude Code")
+
+        # 显示可用的 agents
+        available_agents = []
+        if self.codex and self.codex.is_running():
+            available_agents.append("Codex")
+        if self.claude and self.claude.is_running():
+            available_agents.append("Claude Code")
+
+        print(f"   Available: {', '.join(available_agents)}")
         print("="*60)
         print("Type '/help' for commands")
         print("="*60 + "\n")
-        
+
+        # 如果只有 Claude Code 可用，显示提示
+        if not self.codex and self.claude:
+            print("ℹ️  Note: Codex is not available, using Claude Code only")
+            print("   You can interact directly with Claude Code\n")
+
         self._start_monitoring()
-        
+
+        # 选择提示符
+        prompt = "claude> " if (not self.codex and self.claude) else "codex> "
+
         try:
             while True:
                 try:
-                    # 显示 Codex 提示符
-                    user_input = input("codex> ").strip()
-                    
+                    user_input = input(prompt).strip()
+
                     if not user_input:
                         continue
-                    
+
                     # 处理特殊命令
                     if user_input.startswith('/'):
                         self._handle_command(user_input)
-                    
-                    # 向 Claude Code 发送命令（使用 > 前缀）
-                    elif user_input.startswith('>'):
-                        self._send_to_claude(user_input[1:].strip())
-                    
+
+                    # 向 Claude Code 发送命令（使用 > 前缀或直接输入）
+                    elif user_input.startswith('>') or (not self.codex and self.claude):
+                        command = user_input[1:].strip() if user_input.startswith('>') else user_input
+                        self._send_to_claude(command)
+
                     # 正常输入发送给 Codex
-                    else:
+                    elif self.codex:
                         self._send_to_codex(user_input)
-                
+                    else:
+                        print("⚠️  No agent available to handle this command")
+
                 except KeyboardInterrupt:
                     print("\n\nUse '/exit' to quit")
                 except EOFError:
                     break
-        
+
         finally:
             self.monitoring = False
             print("\n✅ Session ended")
@@ -391,15 +453,19 @@ NOTES:
     
     def _send_to_codex(self, command: str):
         """向 Codex 发送命令并显示响应"""
+        if not self.codex or not self.codex.is_running():
+            print("❌ Codex is not available")
+            return
+
         print(f"→ Sending to Codex: {command}")
-        
+
         if not self.codex.send_command(command):
             print("❌ Failed to send command to Codex")
             return
-        
+
         # 等待 Codex 处理
         time.sleep(0.3)
-        
+
         # 读取 Codex 的输出
         output = ""
         for _ in range(10):  # 最多等待 1 秒
@@ -407,7 +473,7 @@ NOTES:
             if chunk:
                 output += chunk
             time.sleep(0.1)
-        
+
         if output.strip():
             # 过滤回显和提示符
             lines = output.strip().split('\n')
@@ -418,15 +484,19 @@ NOTES:
     
     def _send_to_claude(self, command: str):
         """从 Codex 向 Claude Code 发送命令"""
+        if not self.claude or not self.claude.is_running():
+            print("❌ Claude Code is not available")
+            return
+
         print(f"\n🔵 Claude Code ← Sending: {command}")
-        
+
         if not self.claude.send_command(command):
             print("❌ Failed to send command to Claude Code")
             return
-        
+
         # 等待 Claude Code 处理
         time.sleep(0.5)
-        
+
         # 读取 Claude Code 的输出
         output = ""
         for _ in range(20):  # 最多等待 2 秒
@@ -434,7 +504,7 @@ NOTES:
             if chunk:
                 output += chunk
             time.sleep(0.1)
-        
+
         if output.strip():
             print("\n🔵 Claude Code Output:")
             print("-" * 50)
@@ -446,13 +516,20 @@ NOTES:
             print("-" * 50)
         else:
             print("(No output from Claude Code)")
-        
-        print("\n继续 Codex 会话...\n")
+
+        if self.codex:
+            print("\n继续 Codex 会话...\n")
+        else:
+            print()
     
     def _show_claude_output(self):
         """显示 Claude Code 的最新输出"""
+        if not self.claude or not self.claude.is_running():
+            print("❌ Claude Code is not available")
+            return
+
         output = self.claude.read_output(timeout=0.5)
-        
+
         if output.strip():
             print("\n--- Claude Code Output ---")
             print(output)
