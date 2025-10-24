@@ -54,6 +54,10 @@ class CLIAgent:
 
         self.logger = logging.getLogger(f'agent.{name}')
         self.output_buffer = ""  # 缓存输出
+
+        # 心跳机制（用于保持 codex 活跃）
+        self.heartbeat_thread: Optional[threading.Thread] = None
+        self.heartbeat_running = False
     
     def start(self) -> bool:
         """启动 CLI 进程在 PTY 中"""
@@ -211,6 +215,10 @@ class CLIAgent:
             else:
                 self.logger.warning(f"{self.name}: No initial output received (may be normal)")
 
+            # 对于 codex，启动心跳线程保持它活跃
+            if self.cli_command == 'codex':
+                self._start_heartbeat()
+
             return True
 
         except FileNotFoundError:
@@ -301,7 +309,7 @@ class CLIAgent:
         """检查进程是否还在运行"""
         if self.pid is None:
             return False
-        
+
         try:
             # 使用 os.kill 的信号 0 来测试进程是否存在
             os.kill(self.pid, 0)
@@ -309,12 +317,63 @@ class CLIAgent:
         except (ProcessLookupError, OSError):
             self.process_running = False
             return False
-    
+
+    def _start_heartbeat(self):
+        """启动心跳线程保持 codex 活跃"""
+        def heartbeat():
+            self.logger.debug(f"{self.name}: Starting heartbeat thread")
+            last_heartbeat_time = time.time()
+
+            while self.heartbeat_running and self.is_running():
+                current_time = time.time()
+
+                # 每 5 秒发送一次心跳
+                if current_time - last_heartbeat_time >= 5:
+                    try:
+                        if self.fd and not self.pty_closed:
+                            # 发送一个空换行作为心跳
+                            os.write(self.fd, b'\n')
+                            self.logger.debug(f"{self.name}: Heartbeat sent")
+
+                            # 尝试读取任何响应（清理缓冲区）
+                            try:
+                                response = os.read(self.fd, 4096)
+                                if response:
+                                    self.output_buffer += response.decode('utf-8', errors='replace')
+                            except OSError:
+                                pass  # 忽略读取错误
+
+                            last_heartbeat_time = current_time
+                    except OSError as e:
+                        self.logger.debug(f"{self.name}: Heartbeat failed: {e}")
+                        if e.errno == 5:  # EIO - PTY closed
+                            break
+
+                time.sleep(1)  # 每秒检查一次
+
+            self.logger.debug(f"{self.name}: Heartbeat thread stopped")
+
+        self.heartbeat_running = True
+        self.heartbeat_thread = threading.Thread(target=heartbeat, daemon=True)
+        self.heartbeat_thread.start()
+        self.logger.info(f"{self.name}: Heartbeat enabled (5s interval)")
+
+    def _stop_heartbeat(self):
+        """停止心跳线程"""
+        if self.heartbeat_running:
+            self.heartbeat_running = False
+            if self.heartbeat_thread:
+                self.heartbeat_thread.join(timeout=2)
+            self.logger.debug(f"{self.name}: Heartbeat stopped")
+
     def terminate(self):
         """优雅地终止 Agent"""
         if self.pid is None:
             return
-        
+
+        # 停止心跳线程
+        self._stop_heartbeat()
+
         try:
             # 首先尝试 SIGTERM
             os.kill(self.pid, signal.SIGTERM)
