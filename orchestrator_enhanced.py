@@ -137,9 +137,21 @@ class CLIAgent:
             except OSError:
                 pass  # 进程仍在运行
 
-            # 如果没有初始输出，可能需要发送一个输入来激活进程
-            # 这对于某些交互式 CLI 是必要的
-            if not initial_output or len(initial_output.strip()) < 10:
+            # 如果没有实质性的初始输出，可能需要发送一个输入来激活进程
+            # 检查是否有有意义的内容（过滤掉 ANSI 转义序列后）
+            import re
+            clean_output = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', initial_output)
+            meaningful_content = clean_output.strip()
+
+            # 如果没有实质内容，或者看起来只是 ANSI 序列，发送换行来激活
+            should_send_newline = (
+                not initial_output or
+                len(meaningful_content) < 10 or
+                # 对于 codex，总是尝试发送换行（它可能需要交互）
+                self.cli_command == 'codex'
+            )
+
+            if should_send_newline:
                 self.logger.debug(f"{self.name}: Sending initial newline to activate CLI")
                 try:
                     # 发送一个换行符
@@ -171,10 +183,8 @@ class CLIAgent:
 
             # 如果有初始输出，记录一下（但过滤 ANSI 转义序列以便阅读）
             if initial_output:
-                # 简单过滤 ANSI 转义序列用于日志
-                import re
-                clean_output = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', initial_output)
-                self.logger.debug(f"{self.name} initial output: {clean_output[:200]}")
+                # clean_output 已经在上面定义了
+                self.logger.debug(f"{self.name} initial output: {meaningful_content[:200]}")
             else:
                 self.logger.warning(f"{self.name}: No initial output received (may be normal)")
 
