@@ -159,8 +159,10 @@ class CLIAgent:
             if should_send_newline:
                 self.logger.debug(f"{self.name}: Sending initial newline to activate CLI")
                 try:
-                    # 发送一个换行符
+                    # 发送 C-j + C-m 激活提示符
                     os.write(self.fd, b'\n')
+                    time.sleep(0.05)
+                    os.write(self.fd, b'\r')
                     time.sleep(0.3)
 
                     # 尝试读取响应
@@ -243,9 +245,13 @@ class CLIAgent:
             return False
 
         try:
-            # 发送命令 + Enter
-            cmd_bytes = (command + '\n').encode('utf-8')
+            # 发送命令，并通过 C-j + C-m 组合触发发送
+            cmd_bytes = command.encode('utf-8')
             os.write(self.fd, cmd_bytes)
+            time.sleep(0.05)
+            os.write(self.fd, b'\n')  # C-j (LF)
+            time.sleep(0.05)
+            os.write(self.fd, b'\r')  # C-m (CR)
 
             self.logger.debug(f"→ {self.name}: {command[:60]}")
             return True
@@ -343,8 +349,10 @@ class CLIAgent:
                 if current_time - last_heartbeat_time >= 10:
                     try:
                         if self.fd and not self.pty_closed:
-                            # 发送一个空换行作为心跳
+                            # 发送一个空行（C-j + C-m）作为心跳
                             os.write(self.fd, b'\n')
+                            time.sleep(0.05)
+                            os.write(self.fd, b'\r')
                             self.logger.debug(f"{self.name}: Heartbeat sent")
 
                             # 尝试读取任何响应（清理缓冲区）
@@ -707,7 +715,7 @@ NOTES:
     def _handle_command(self, cmd: str):
         """处理特殊命令"""
         cmd = cmd.lower().strip()
-        
+
         if cmd == '/help':
             self.show_help()
         
@@ -726,7 +734,42 @@ NOTES:
         
         else:
             print(f"Unknown command: {cmd}")
-    
+
+    def _collect_agent_output(self, agent: CLIAgent, label: str, initial_delay: float = 2.5) -> str:
+        """等待并收集 Agent 输出，确保获取完整响应"""
+        time.sleep(initial_delay)
+
+        output = ""
+        start_time = time.time()
+        max_duration = 45.0  # 最长等待 45 秒
+        empty_attempts = 0
+        chunk_counter = 0
+
+        while time.time() - start_time < max_duration:
+            chunk = agent.read_output(timeout=3.0)
+
+            if chunk:
+                chunk_counter += 1
+                empty_attempts = 0
+                output += chunk
+                self.logger.debug(f"Received {label} chunk {chunk_counter}: {len(chunk)} bytes")
+
+                # 短暂等待，避免遗漏连续输出
+                time.sleep(0.5)
+            else:
+                empty_attempts += 1
+
+                # 如果已经收到内容，并且连续多次没有新数据，则认为完成
+                if output.strip() and empty_attempts >= 3:
+                    self.logger.debug(f"No more {label} content after {empty_attempts} empty attempts")
+                    break
+
+                # 未收到内容或仍在等待更多输出时，稍作等待
+                time.sleep(1.0)
+
+        self.logger.debug(f"Total {label} output received: {len(output)} bytes")
+        return output
+
     def _send_to_claude1(self, command: str):
         """向 Claude-1 发送命令并显示响应"""
         if not self.claude1 or not self.claude1.is_running():
@@ -739,28 +782,7 @@ NOTES:
             print("❌ Failed to send command to Claude-1")
             return
 
-        # 等待 Claude-1 处理（AI 模型需要更长时间生成响应）
-        time.sleep(2.0)
-
-        # 读取 Claude-1 的输出
-        output = ""
-        max_wait = 9  # 最多等待约 20 秒（2秒初始 + 9次 * 2秒）
-        for i in range(max_wait):
-            chunk = self.claude1.read_output(timeout=3.0)
-            if chunk:
-                self.logger.debug(f"Received chunk {i+1}: {len(chunk)} bytes")
-                output += chunk
-                # 如果收到内容，继续读取一段时间以确保获取完整响应
-                if i < max_wait - 1:
-                    time.sleep(0.5)
-            else:
-                # 如果已经有输出且连续没有新内容，停止等待
-                if output.strip():
-                    self.logger.debug(f"No more content after {i+1} attempts, stopping")
-                    break
-                time.sleep(2.0)
-
-        self.logger.debug(f"Total output received: {len(output)} bytes")
+        output = self._collect_agent_output(self.claude1, "Claude-1")
 
         if output.strip():
             # 过滤回显和提示符
@@ -784,28 +806,7 @@ NOTES:
             print("❌ Failed to send command to Claude-2")
             return
 
-        # 等待 Claude-2 处理（AI 模型需要更长时间生成响应）
-        time.sleep(2.0)
-
-        # 读取 Claude-2 的输出
-        output = ""
-        max_wait = 9  # 最多等待约 20 秒（2秒初始 + 9次 * 2秒）
-        for i in range(max_wait):
-            chunk = self.claude2.read_output(timeout=3.0)
-            if chunk:
-                self.logger.debug(f"Received Claude chunk {i+1}: {len(chunk)} bytes")
-                output += chunk
-                # 如果收到内容，继续读取一段时间以确保获取完整响应
-                if i < max_wait - 1:
-                    time.sleep(0.5)
-            else:
-                # 如果已经有输出且连续没有新内容，停止等待
-                if output.strip():
-                    self.logger.debug(f"No more Claude content after {i+1} attempts, stopping")
-                    break
-                time.sleep(2.0)
-
-        self.logger.debug(f"Total Claude output received: {len(output)} bytes")
+        output = self._collect_agent_output(self.claude2, "Claude-2")
 
         if output.strip():
             print("\n🔵 Claude-2 Output:")
