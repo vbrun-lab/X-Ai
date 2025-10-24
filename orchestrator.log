@@ -1,0 +1,14 @@
+[2025-10-24 14:58:54,781] orchestrator: Registered agent: codex
+[2025-10-24 14:58:54,782] orchestrator: Registered agent: claude-code
+[2025-10-24 14:58:54,782] orchestrator: Starting AI Orchestrator (MVP)
+[2025-10-24 14:58:54,782] orchestrator: Starting all agents...
+[2025-10-24 14:58:54,785] agent.codex: ✅ Started codex (PID: 8524)
+[2025-10-24 14:58:55,289] agent.claude-code: ✅ Started claude-code (PID: 8538)
+[2025-10-24 14:58:55,789] orchestrator: ✅ All agents started
+[2025-10-24 15:01:42,365] orchestrator: Received interrupt signal, shutting down...
+[2025-10-24 15:01:42,365] orchestrator: Shutting down all agents...
+[2025-10-24 15:01:44,369] agent.claude-code: ✅ Terminated claude-code
+[2025-10-24 15:01:44,369] orchestrator: ✅ All agents shut down
+[2025-10-24 15:01:44,370] orchestrator: Shutting down all agents...
+[2025-10-24 15:01:46,373] agent.claude-code: ✅ Terminated claude-code
+[2025-10-24 15:01:46,374] orchestrator: ✅ All agents shut down
