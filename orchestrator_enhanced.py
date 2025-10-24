@@ -729,16 +729,24 @@ NOTES:
             print("❌ Failed to send command to Codex")
             return
 
-        # 等待 Codex 处理
-        time.sleep(0.3)
+        # 等待 Codex 处理（AI 模型需要更长时间生成响应）
+        time.sleep(1.5)
 
         # 读取 Codex 的输出
         output = ""
-        for _ in range(10):  # 最多等待 1 秒
-            chunk = self.codex.read_output(timeout=0.1)
+        max_wait = 30  # 最多等待 30 秒
+        for i in range(max_wait):
+            chunk = self.codex.read_output(timeout=0.5)
             if chunk:
                 output += chunk
-            time.sleep(0.1)
+                # 如果收到内容，继续读取一段时间以确保获取完整响应
+                if i < max_wait - 1:
+                    time.sleep(0.3)
+            else:
+                # 如果已经有输出且连续没有新内容，停止等待
+                if output.strip():
+                    break
+                time.sleep(0.5)
 
         if output.strip():
             # 过滤回显和提示符
@@ -747,6 +755,8 @@ NOTES:
                 line = line.strip()
                 if line and not line.startswith('codex>'):
                     print(line)
+        else:
+            print("⚠️  No response from Codex (timeout after 30s)")
     
     def _send_to_claude(self, command: str):
         """从 Codex 向 Claude Code 发送命令"""
@@ -760,16 +770,24 @@ NOTES:
             print("❌ Failed to send command to Claude Code")
             return
 
-        # 等待 Claude Code 处理
-        time.sleep(0.5)
+        # 等待 Claude Code 处理（AI 模型需要更长时间生成响应）
+        time.sleep(1.5)
 
         # 读取 Claude Code 的输出
         output = ""
-        for _ in range(20):  # 最多等待 2 秒
-            chunk = self.claude.read_output(timeout=0.1)
+        max_wait = 30  # 最多等待 30 秒
+        for i in range(max_wait):
+            chunk = self.claude.read_output(timeout=0.5)
             if chunk:
                 output += chunk
-            time.sleep(0.1)
+                # 如果收到内容，继续读取一段时间以确保获取完整响应
+                if i < max_wait - 1:
+                    time.sleep(0.3)
+            else:
+                # 如果已经有输出且连续没有新内容，停止等待
+                if output.strip():
+                    break
+                time.sleep(0.5)
 
         if output.strip():
             print("\n🔵 Claude Code Output:")
@@ -781,7 +799,7 @@ NOTES:
                     print(line)
             print("-" * 50)
         else:
-            print("(No output from Claude Code)")
+            print("⚠️  No response from Claude Code (timeout after 30s)")
 
         if self.codex:
             print("\n继续 Codex 会话...\n")
