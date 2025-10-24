@@ -264,9 +264,6 @@ class CLIAgent:
             output = self.output_buffer
             self.output_buffer = ""  # 清空 buffer
 
-        if output:
-            self.logger.debug(f"read_output: Got {len(output)} bytes from buffer")
-
         # 如果 PTY 已关闭，只返回 buffer 中剩余的内容
         if self.pty_closed:
             return output
@@ -289,7 +286,6 @@ class CLIAgent:
                         if chunk:
                             decoded = chunk.decode('utf-8', errors='replace')
                             output += decoded
-                            self.logger.debug(f"read_output: Read {len(chunk)} bytes from PTY")
                         # 不要在这里设置 process_running = False
                         # 空 chunk 不一定意味着进程退出
                     except OSError as e:
@@ -318,11 +314,6 @@ class CLIAgent:
             import re
             # 保留可打印字符和换行符，删除 ANSI 转义序列
             output = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', output)
-
-        if output:
-            self.logger.debug(f"read_output: Returning {len(output)} bytes total")
-        else:
-            self.logger.debug(f"read_output: No output to return")
 
         return output
     
