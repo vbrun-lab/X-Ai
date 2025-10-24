@@ -137,6 +137,35 @@ class CLIAgent:
             except OSError:
                 pass  # 进程仍在运行
 
+            # 如果没有初始输出，可能需要发送一个输入来激活进程
+            # 这对于某些交互式 CLI 是必要的
+            if not initial_output or len(initial_output.strip()) < 10:
+                self.logger.debug(f"{self.name}: Sending initial newline to activate CLI")
+                try:
+                    # 发送一个换行符
+                    os.write(self.fd, b'\n')
+                    time.sleep(0.3)
+
+                    # 尝试读取响应
+                    try:
+                        response = os.read(self.fd, 4096)
+                        if response:
+                            decoded = response.decode('utf-8', errors='replace')
+                            initial_output += decoded
+                            self.output_buffer += decoded
+                            self.logger.debug(f"{self.name}: Got response after newline: {len(decoded)} bytes")
+                    except OSError as e:
+                        if e.errno == 5:  # EIO
+                            self.logger.error(f"❌ {self.name}: PTY closed after sending newline")
+                            # 再次检查进程状态
+                            pid_result, status = os.waitpid(self.pid, os.WNOHANG)
+                            if pid_result != 0:
+                                exit_code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else -1
+                                self.logger.error(f"   Process exited with code {exit_code}")
+                            return False
+                except OSError as e:
+                    self.logger.debug(f"{self.name}: Could not send initial newline: {e}")
+
             self.process_running = True
             self.logger.info(f"✅ Started {self.name} (PID: {self.pid})")
 
@@ -146,6 +175,8 @@ class CLIAgent:
                 import re
                 clean_output = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', initial_output)
                 self.logger.debug(f"{self.name} initial output: {clean_output[:200]}")
+            else:
+                self.logger.warning(f"{self.name}: No initial output received (may be normal)")
 
             return True
 
