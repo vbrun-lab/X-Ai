@@ -46,11 +46,12 @@ class CLIAgent:
         """
         self.name = name
         self.cli_command = cli_command
-        
+
         self.pid: Optional[int] = None
         self.fd: Optional[int] = None  # PTY master fd
         self.process_running = False
-        
+        self.pty_closed = False  # 跟踪 PTY 是否已关闭
+
         self.logger = logging.getLogger(f'agent.{name}')
         self.output_buffer = ""  # 缓存输出
     
@@ -185,6 +186,10 @@ class CLIAgent:
         if not self.stdout_fd:
             return ""
 
+        # 如果 PTY 已关闭，不要尝试读取
+        if self.pty_closed:
+            return ""
+
         # 首先检查进程是否还在运行
         if not self.is_running():
             return ""
@@ -210,8 +215,10 @@ class CLIAgent:
                             continue
                         # EIO (errno 5) 通常意味着 PTY slave 已关闭（进程退出）
                         elif e.errno == 5:
-                            self.logger.debug(f"{self.name}: PTY closed (process likely exited)")
-                            self.process_running = False
+                            if not self.pty_closed:
+                                self.logger.debug(f"{self.name}: PTY closed (process likely exited)")
+                                self.pty_closed = True
+                                self.process_running = False
                             break
                         else:
                             self.logger.debug(f"Error reading from {self.name}: {e}")
@@ -431,11 +438,31 @@ NOTES:
 
             while self.monitoring and self.orchestrator.running:
                 # 检查 Codex 状态变化
-                if self.codex:
+                if self.codex and self.codex.pid:
                     codex_running_now = self.codex.is_running()
                     if codex_was_running and not codex_running_now:
-                        self.logger.warning("⚠️  Codex process has exited unexpectedly")
-                        print("\n⚠️  Warning: Codex has stopped running\n")
+                        # 尝试获取退出状态
+                        try:
+                            pid_result, status = os.waitpid(self.codex.pid, os.WNOHANG)
+                            if pid_result != 0:
+                                if os.WIFEXITED(status):
+                                    exit_code = os.WEXITSTATUS(status)
+                                    self.logger.warning(f"⚠️  Codex exited with code {exit_code}")
+                                    print(f"\n⚠️  Warning: Codex exited with code {exit_code}\n")
+                                elif os.WIFSIGNALED(status):
+                                    signal_num = os.WTERMSIG(status)
+                                    self.logger.warning(f"⚠️  Codex killed by signal {signal_num}")
+                                    print(f"\n⚠️  Warning: Codex killed by signal {signal_num}\n")
+                                else:
+                                    self.logger.warning("⚠️  Codex exited unexpectedly")
+                                    print("\n⚠️  Warning: Codex exited unexpectedly\n")
+                            else:
+                                self.logger.warning("⚠️  Codex stopped running")
+                                print("\n⚠️  Warning: Codex stopped running\n")
+                        except (OSError, ChildProcessError):
+                            self.logger.warning("⚠️  Codex stopped running")
+                            print("\n⚠️  Warning: Codex stopped running\n")
+
                         print("codex> ", end='', flush=True)  # 重新显示提示符
                     codex_was_running = codex_running_now
 
@@ -449,11 +476,31 @@ NOTES:
                             self.logger.debug(f"Error in monitor reading codex: {e}")
 
                 # 检查 Claude Code 状态变化
-                if self.claude:
+                if self.claude and self.claude.pid:
                     claude_running_now = self.claude.is_running()
                     if claude_was_running and not claude_running_now:
-                        self.logger.warning("⚠️  Claude Code process has exited unexpectedly")
-                        print("\n⚠️  Warning: Claude Code has stopped running\n")
+                        # 尝试获取退出状态
+                        try:
+                            pid_result, status = os.waitpid(self.claude.pid, os.WNOHANG)
+                            if pid_result != 0:
+                                if os.WIFEXITED(status):
+                                    exit_code = os.WEXITSTATUS(status)
+                                    self.logger.warning(f"⚠️  Claude Code exited with code {exit_code}")
+                                    print(f"\n⚠️  Warning: Claude Code exited with code {exit_code}\n")
+                                elif os.WIFSIGNALED(status):
+                                    signal_num = os.WTERMSIG(status)
+                                    self.logger.warning(f"⚠️  Claude Code killed by signal {signal_num}")
+                                    print(f"\n⚠️  Warning: Claude Code killed by signal {signal_num}\n")
+                                else:
+                                    self.logger.warning("⚠️  Claude Code exited unexpectedly")
+                                    print("\n⚠️  Warning: Claude Code exited unexpectedly\n")
+                            else:
+                                self.logger.warning("⚠️  Claude Code stopped running")
+                                print("\n⚠️  Warning: Claude Code stopped running\n")
+                        except (OSError, ChildProcessError):
+                            self.logger.warning("⚠️  Claude Code stopped running")
+                            print("\n⚠️  Warning: Claude Code stopped running\n")
+
                         print("claude> ", end='', flush=True)  # 重新显示提示符
                     claude_was_running = claude_running_now
 
