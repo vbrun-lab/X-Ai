@@ -3,9 +3,9 @@
 orchestrator_enhanced.py - 增强版最小可行版本
 
 改进：
-1. Codex 可以通过 > 符号向 Claude Code 发送命令
+1. Claude-1 可以通过 > 符号向 Claude-2 发送命令
    例如: > claude write a python function
-2. Claude Code 的输出自动返回给 Codex
+2. Claude-2 的输出自动返回给 Claude-1
 3. 支持多轮对话和协作
 4. 为未来添加更多 AI 预留架构
 """
@@ -411,7 +411,7 @@ class CLIAgent:
 
 
 class Orchestrator:
-    """主控器：管理 Codex 和 Claude Code 的交互"""
+    """主控器：管理 Claude-1 和 Claude-2 的交互"""
     
     def __init__(self):
         self.agents: Dict[str, CLIAgent] = {}
@@ -499,25 +499,25 @@ class Orchestrator:
 
 
 class InteractiveSession:
-    """与 Codex 的交互式会话，支持 Codex 驱动 Claude Code"""
+    """与 Claude-1 的交互式会话，支持 Claude-1 驱动 Claude-2"""
     
     def __init__(self, orchestrator: Orchestrator):
         self.orchestrator = orchestrator
-        self.codex = orchestrator.get_agent("codex")
-        self.claude = orchestrator.get_agent("claude-code")
+        self.claude1 = orchestrator.get_agent("claude-1")
+        self.claude2 = orchestrator.get_agent("claude-2")
         self.logger = logging.getLogger('session')
 
         # 检查至少有一个 agent 可用
-        if not self.codex and not self.claude:
+        if not self.claude1 and not self.claude2:
             raise RuntimeError("No agents available")
 
         # 检查 codex 是否真的在运行
-        if self.codex and not self.codex.is_running():
-            self.logger.warning("⚠️  Codex agent not running, will use Claude Code only")
-            self.codex = None
+        if self.claude1 and not self.claude1.is_running():
+            self.logger.warning("⚠️  Claude-1 agent not running, will use Claude-2 only")
+            self.claude1 = None
 
-        if not self.claude or not self.claude.is_running():
-            if not self.codex or not self.codex.is_running():
+        if not self.claude2 or not self.claude2.is_running():
+            if not self.claude1 or not self.claude1.is_running():
                 raise RuntimeError("No running agents available")
 
         # 监听线程
@@ -528,37 +528,37 @@ class InteractiveSession:
         """显示帮助信息"""
         help_text = """
 ╔════════════════════════════════════════════════════════════╗
-║     AI Orchestrator - Codex Driving Claude Code           ║
+║     AI Orchestrator - Claude-1 Driving Claude-2           ║
 ╚════════════════════════════════════════════════════════════╝
 
 INTERACTIVE MODE:
-  直接输入任务 → 由 Codex 处理
+  直接输入任务 → 由 Claude-1 处理
   例: write a Python function to calculate factorial
 
-SPECIAL COMMANDS (在 Codex 中执行):
-  > claude [command]   向 Claude Code 发送命令
+SPECIAL COMMANDS (在 Claude-1 中执行):
+  > claude [command]   向 Claude-2 发送命令
   例: > claude optimize the previous code
   
   /status              显示 Agent 状态
-  /claude_output       查看 Claude Code 的最新输出
+  /claude_output       查看 Claude-2 的最新输出
   /clear               清屏
   /help                显示此帮助
   /exit                退出
 
 WORKFLOW EXAMPLE:
   codex> write a python function
-  [Codex 思考...并可能调用 Claude Code]
+  [Claude-1 思考...并可能调用 Claude-2]
   
   codex> > claude make it more efficient
-  [Codex 向 Claude Code 发送: make it more efficient]
-  [Claude Code 执行，输出返回给 Codex]
+  [Claude-1 向 Claude-2 发送: make it more efficient]
+  [Claude-2 执行，输出返回给 Claude-1]
   
   codex> > claude add error handling
   [继续对话...]
 
 NOTES:
   - 所有输出自动记录到 orchestrator.log
-  - Codex 和 Claude Code 都在后台运行
+  - Claude-1 和 Claude-2 都在后台运行
   - 架构支持未来添加更多 AI (Gemini etc.)
 """
         print(help_text)
@@ -566,79 +566,79 @@ NOTES:
     def _start_monitoring(self):
         """启动后台监听线程（监控输出和进程状态）"""
         # 跟踪已知的进程状态
-        codex_was_running = self.codex and self.codex.is_running()
-        claude_was_running = self.claude and self.claude.is_running()
+        claude1_was_running = self.claude1 and self.claude1.is_running()
+        claude2_was_running = self.claude2 and self.claude2.is_running()
 
         def monitor():
-            nonlocal codex_was_running, claude_was_running
+            nonlocal claude1_was_running, claude2_was_running
 
             while self.monitoring and self.orchestrator.running:
-                # 检查 Codex 状态变化
-                if self.codex and self.codex.pid:
-                    codex_running_now = self.codex.is_running()
-                    if codex_was_running and not codex_running_now:
+                # 检查 Claude-1 状态变化
+                if self.claude1 and self.claude1.pid:
+                    claude1_running_now = self.claude1.is_running()
+                    if claude1_was_running and not claude1_running_now:
                         # 尝试获取退出状态
                         try:
-                            pid_result, status = os.waitpid(self.codex.pid, os.WNOHANG)
+                            pid_result, status = os.waitpid(self.claude1.pid, os.WNOHANG)
                             if pid_result != 0:
                                 if os.WIFEXITED(status):
                                     exit_code = os.WEXITSTATUS(status)
-                                    self.logger.warning(f"⚠️  Codex exited with code {exit_code}")
-                                    print(f"\n⚠️  Warning: Codex exited with code {exit_code}\n")
+                                    self.logger.warning(f"⚠️  Claude-1 exited with code {exit_code}")
+                                    print(f"\n⚠️  Warning: Claude-1 exited with code {exit_code}\n")
                                 elif os.WIFSIGNALED(status):
                                     signal_num = os.WTERMSIG(status)
-                                    self.logger.warning(f"⚠️  Codex killed by signal {signal_num}")
-                                    print(f"\n⚠️  Warning: Codex killed by signal {signal_num}\n")
+                                    self.logger.warning(f"⚠️  Claude-1 killed by signal {signal_num}")
+                                    print(f"\n⚠️  Warning: Claude-1 killed by signal {signal_num}\n")
                                 else:
-                                    self.logger.warning("⚠️  Codex exited unexpectedly")
-                                    print("\n⚠️  Warning: Codex exited unexpectedly\n")
+                                    self.logger.warning("⚠️  Claude-1 exited unexpectedly")
+                                    print("\n⚠️  Warning: Claude-1 exited unexpectedly\n")
                             else:
-                                self.logger.warning("⚠️  Codex stopped running")
-                                print("\n⚠️  Warning: Codex stopped running\n")
+                                self.logger.warning("⚠️  Claude-1 stopped running")
+                                print("\n⚠️  Warning: Claude-1 stopped running\n")
                         except (OSError, ChildProcessError):
-                            self.logger.warning("⚠️  Codex stopped running")
-                            print("\n⚠️  Warning: Codex stopped running\n")
+                            self.logger.warning("⚠️  Claude-1 stopped running")
+                            print("\n⚠️  Warning: Claude-1 stopped running\n")
 
-                        print("codex> ", end='', flush=True)  # 重新显示提示符
-                    codex_was_running = codex_running_now
+                        print("claude1> ", end='', flush=True)  # 重新显示提示符
+                    claude1_was_running = claude1_running_now
 
                     # 只在进程运行时读取输出
-                    if codex_running_now:
+                    if claude1_running_now:
                         try:
-                            output = self.codex.read_output(timeout=0.1)
+                            output = self.claude1.read_output(timeout=0.1)
                             if output and "[BACKGROUND]" in output:
-                                self.logger.info(f"Codex background: {output[:100]}")
+                                self.logger.info(f"Claude-1 background: {output[:100]}")
                         except Exception as e:
                             self.logger.debug(f"Error in monitor reading codex: {e}")
 
-                # 检查 Claude Code 状态变化
-                if self.claude and self.claude.pid:
-                    claude_running_now = self.claude.is_running()
-                    if claude_was_running and not claude_running_now:
+                # 检查 Claude-2 状态变化
+                if self.claude2 and self.claude2.pid:
+                    claude2_running_now = self.claude2.is_running()
+                    if claude2_was_running and not claude2_running_now:
                         # 尝试获取退出状态
                         try:
-                            pid_result, status = os.waitpid(self.claude.pid, os.WNOHANG)
+                            pid_result, status = os.waitpid(self.claude2.pid, os.WNOHANG)
                             if pid_result != 0:
                                 if os.WIFEXITED(status):
                                     exit_code = os.WEXITSTATUS(status)
-                                    self.logger.warning(f"⚠️  Claude Code exited with code {exit_code}")
-                                    print(f"\n⚠️  Warning: Claude Code exited with code {exit_code}\n")
+                                    self.logger.warning(f"⚠️  Claude-2 exited with code {exit_code}")
+                                    print(f"\n⚠️  Warning: Claude-2 exited with code {exit_code}\n")
                                 elif os.WIFSIGNALED(status):
                                     signal_num = os.WTERMSIG(status)
-                                    self.logger.warning(f"⚠️  Claude Code killed by signal {signal_num}")
-                                    print(f"\n⚠️  Warning: Claude Code killed by signal {signal_num}\n")
+                                    self.logger.warning(f"⚠️  Claude-2 killed by signal {signal_num}")
+                                    print(f"\n⚠️  Warning: Claude-2 killed by signal {signal_num}\n")
                                 else:
-                                    self.logger.warning("⚠️  Claude Code exited unexpectedly")
-                                    print("\n⚠️  Warning: Claude Code exited unexpectedly\n")
+                                    self.logger.warning("⚠️  Claude-2 exited unexpectedly")
+                                    print("\n⚠️  Warning: Claude-2 exited unexpectedly\n")
                             else:
-                                self.logger.warning("⚠️  Claude Code stopped running")
-                                print("\n⚠️  Warning: Claude Code stopped running\n")
+                                self.logger.warning("⚠️  Claude-2 stopped running")
+                                print("\n⚠️  Warning: Claude-2 stopped running\n")
                         except (OSError, ChildProcessError):
-                            self.logger.warning("⚠️  Claude Code stopped running")
-                            print("\n⚠️  Warning: Claude Code stopped running\n")
+                            self.logger.warning("⚠️  Claude-2 stopped running")
+                            print("\n⚠️  Warning: Claude-2 stopped running\n")
 
-                        print("claude> ", end='', flush=True)  # 重新显示提示符
-                    claude_was_running = claude_running_now
+                        print("claude2> ", end='', flush=True)  # 重新显示提示符
+                    claude2_was_running = claude2_running_now
 
                 time.sleep(3.0)  # 监控间隔（3秒足够检测进程退出）
 
@@ -652,25 +652,25 @@ NOTES:
 
         # 显示可用的 agents
         available_agents = []
-        if self.codex and self.codex.is_running():
-            available_agents.append("Codex")
-        if self.claude and self.claude.is_running():
-            available_agents.append("Claude Code")
+        if self.claude1 and self.claude1.is_running():
+            available_agents.append("Claude-1")
+        if self.claude2 and self.claude2.is_running():
+            available_agents.append("Claude-2")
 
         print(f"   Available: {', '.join(available_agents)}")
         print("="*60)
         print("Type '/help' for commands")
         print("="*60 + "\n")
 
-        # 如果只有 Claude Code 可用，显示提示
-        if not self.codex and self.claude:
-            print("ℹ️  Note: Codex is not available, using Claude Code only")
-            print("   You can interact directly with Claude Code\n")
+        # 如果只有 Claude-2 可用，显示提示
+        if not self.claude1 and self.claude2:
+            print("ℹ️  Note: Claude-1 is not available, using Claude-2 only")
+            print("   You can interact directly with Claude-2\n")
 
         self._start_monitoring()
 
         # 选择提示符
-        prompt = "claude> " if (not self.codex and self.claude) else "codex> "
+        prompt = "claude2> " if (not self.claude1 and self.claude2) else "claude1> "
 
         try:
             while True:
@@ -684,14 +684,14 @@ NOTES:
                     if user_input.startswith('/'):
                         self._handle_command(user_input)
 
-                    # 向 Claude Code 发送命令（使用 > 前缀或直接输入）
-                    elif user_input.startswith('>') or (not self.codex and self.claude):
+                    # 向 Claude-2 发送命令（使用 > 前缀或直接输入）
+                    elif user_input.startswith('>') or (not self.claude1 and self.claude2):
                         command = user_input[1:].strip() if user_input.startswith('>') else user_input
-                        self._send_to_claude(command)
+                        self._send_to_claude2(command)
 
-                    # 正常输入发送给 Codex
-                    elif self.codex:
-                        self._send_to_codex(user_input)
+                    # 正常输入发送给 Claude-1
+                    elif self.claude1:
+                        self._send_to_claude1(user_input)
                     else:
                         print("⚠️  No agent available to handle this command")
 
@@ -727,26 +727,26 @@ NOTES:
         else:
             print(f"Unknown command: {cmd}")
     
-    def _send_to_codex(self, command: str):
-        """向 Codex 发送命令并显示响应"""
-        if not self.codex or not self.codex.is_running():
-            print("❌ Codex is not available")
+    def _send_to_claude1(self, command: str):
+        """向 Claude-1 发送命令并显示响应"""
+        if not self.claude1 or not self.claude1.is_running():
+            print("❌ Claude-1 is not available")
             return
 
-        print(f"→ Sending to Codex: {command}")
+        print(f"→ Sending to Claude-1: {command}")
 
-        if not self.codex.send_command(command):
-            print("❌ Failed to send command to Codex")
+        if not self.claude1.send_command(command):
+            print("❌ Failed to send command to Claude-1")
             return
 
-        # 等待 Codex 处理（AI 模型需要更长时间生成响应）
+        # 等待 Claude-1 处理（AI 模型需要更长时间生成响应）
         time.sleep(1.5)
 
-        # 读取 Codex 的输出
+        # 读取 Claude-1 的输出
         output = ""
         max_wait = 30  # 最多等待 30 秒
         for i in range(max_wait):
-            chunk = self.codex.read_output(timeout=3.0)
+            chunk = self.claude1.read_output(timeout=3.0)
             if chunk:
                 self.logger.debug(f"Received chunk {i+1}: {len(chunk)} bytes")
                 output += chunk
@@ -770,28 +770,28 @@ NOTES:
                 if line and not line.startswith('codex>'):
                     print(line)
         else:
-            print("⚠️  No response from Codex (timeout after 30s)")
+            print("⚠️  No response from Claude-1 (timeout after 30s)")
     
-    def _send_to_claude(self, command: str):
-        """从 Codex 向 Claude Code 发送命令"""
-        if not self.claude or not self.claude.is_running():
-            print("❌ Claude Code is not available")
+    def _send_to_claude2(self, command: str):
+        """从 Claude-1 向 Claude-2 发送命令"""
+        if not self.claude2 or not self.claude2.is_running():
+            print("❌ Claude-2 is not available")
             return
 
-        print(f"\n🔵 Claude Code ← Sending: {command}")
+        print(f"\n🔵 Claude-2 ← Sending: {command}")
 
-        if not self.claude.send_command(command):
-            print("❌ Failed to send command to Claude Code")
+        if not self.claude2.send_command(command):
+            print("❌ Failed to send command to Claude-2")
             return
 
-        # 等待 Claude Code 处理（AI 模型需要更长时间生成响应）
+        # 等待 Claude-2 处理（AI 模型需要更长时间生成响应）
         time.sleep(1.5)
 
-        # 读取 Claude Code 的输出
+        # 读取 Claude-2 的输出
         output = ""
         max_wait = 30  # 最多等待 30 秒
         for i in range(max_wait):
-            chunk = self.claude.read_output(timeout=3.0)
+            chunk = self.claude2.read_output(timeout=3.0)
             if chunk:
                 self.logger.debug(f"Received Claude chunk {i+1}: {len(chunk)} bytes")
                 output += chunk
@@ -808,7 +808,7 @@ NOTES:
         self.logger.debug(f"Total Claude output received: {len(output)} bytes")
 
         if output.strip():
-            print("\n🔵 Claude Code Output:")
+            print("\n🔵 Claude-2 Output:")
             print("-" * 50)
             # 只显示关键行
             lines = output.strip().split('\n')
@@ -817,27 +817,27 @@ NOTES:
                     print(line)
             print("-" * 50)
         else:
-            print("⚠️  No response from Claude Code (timeout after 30s)")
+            print("⚠️  No response from Claude-2 (timeout after 30s)")
 
-        if self.codex:
-            print("\n继续 Codex 会话...\n")
+        if self.claude1:
+            print("\n继续 Claude-1 会话...\n")
         else:
             print()
     
     def _show_claude_output(self):
-        """显示 Claude Code 的最新输出"""
-        if not self.claude or not self.claude.is_running():
-            print("❌ Claude Code is not available")
+        """显示 Claude-2 的最新输出"""
+        if not self.claude2 or not self.claude2.is_running():
+            print("❌ Claude-2 is not available")
             return
 
-        output = self.claude.read_output(timeout=0.5)
+        output = self.claude2.read_output(timeout=0.5)
 
         if output.strip():
-            print("\n--- Claude Code Output ---")
+            print("\n--- Claude-2 Output ---")
             print(output)
             print("--- End Output ---\n")
         else:
-            print("(No recent output from Claude Code)")
+            print("(No recent output from Claude-2)")
 
 
 def main():
@@ -845,7 +845,7 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="AI Orchestrator - Codex driving Claude Code",
+        description="AI Orchestrator - Claude-1 driving Claude-2",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -886,8 +886,9 @@ Notes:
     orchestrator = Orchestrator()
 
     # 注册 Agent（为未来添加更多 AI 预留接口）
-    orchestrator.register_agent("codex", "codex")
-    orchestrator.register_agent("claude-code", "claude")
+    # 暂时使用两个 Claude 实例进行测试，放弃 codex
+    orchestrator.register_agent("claude-1", "claude")
+    orchestrator.register_agent("claude-2", "claude")
 
     logger.info("Starting AI Orchestrator (MVP)")
 
