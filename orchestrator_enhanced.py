@@ -102,12 +102,12 @@ class CLIAgent:
             # 保存 stdout_fd 以便后续读取
             self.stdout_fd = self.fd
 
-            # 等待一下让进程初始化
-            time.sleep(0.5)
+            # 等待一下让进程初始化（延长到15秒）
+            time.sleep(15.0)
 
             # 尝试读取初始输出（可能包含欢迎信息和错误）
             initial_output = ""
-            max_read_attempts = 10  # 增加尝试次数以读取完整的欢迎信息
+            max_read_attempts = 30  # 增加尝试次数以读取完整的欢迎信息
             for attempt in range(max_read_attempts):
                 try:
                     chunk = os.read(self.fd, 4096)
@@ -124,7 +124,7 @@ class CLIAgent:
                 time.sleep(0.1)
 
             # 再等待一下，确保进程稳定
-            time.sleep(0.5)
+            time.sleep(2.0)
 
             # 检查进程是否立即退出
             try:
@@ -339,8 +339,8 @@ class CLIAgent:
             while self.heartbeat_running and self.is_running():
                 current_time = time.time()
 
-                # 每 5 秒发送一次心跳
-                if current_time - last_heartbeat_time >= 5:
+                # 每 10 秒发送一次心跳
+                if current_time - last_heartbeat_time >= 10:
                     try:
                         if self.fd and not self.pty_closed:
                             # 发送一个空换行作为心跳
@@ -369,7 +369,7 @@ class CLIAgent:
         self.heartbeat_running = True
         self.heartbeat_thread = threading.Thread(target=heartbeat, daemon=True)
         self.heartbeat_thread.start()
-        self.logger.info(f"{self.name}: Heartbeat enabled (5s interval)")
+        self.logger.info(f"{self.name}: Heartbeat enabled (10s interval)")
 
     def _stop_heartbeat(self):
         """停止心跳线程"""
@@ -640,7 +640,7 @@ NOTES:
                         print("claude2> ", end='', flush=True)  # 重新显示提示符
                     claude2_was_running = claude2_running_now
 
-                time.sleep(3.0)  # 监控间隔（3秒足够检测进程退出）
+                time.sleep(10.0)  # 监控间隔（10秒足够检测进程退出）
 
         self.monitor_thread = threading.Thread(target=monitor, daemon=True)
         self.monitor_thread.start()
@@ -740,11 +740,11 @@ NOTES:
             return
 
         # 等待 Claude-1 处理（AI 模型需要更长时间生成响应）
-        time.sleep(1.5)
+        time.sleep(2.0)
 
         # 读取 Claude-1 的输出
         output = ""
-        max_wait = 30  # 最多等待 30 秒
+        max_wait = 9  # 最多等待约 20 秒（2秒初始 + 9次 * 2秒）
         for i in range(max_wait):
             chunk = self.claude1.read_output(timeout=3.0)
             if chunk:
@@ -752,13 +752,13 @@ NOTES:
                 output += chunk
                 # 如果收到内容，继续读取一段时间以确保获取完整响应
                 if i < max_wait - 1:
-                    time.sleep(0.3)
+                    time.sleep(0.5)
             else:
                 # 如果已经有输出且连续没有新内容，停止等待
                 if output.strip():
                     self.logger.debug(f"No more content after {i+1} attempts, stopping")
                     break
-                time.sleep(3.0)
+                time.sleep(2.0)
 
         self.logger.debug(f"Total output received: {len(output)} bytes")
 
@@ -767,10 +767,10 @@ NOTES:
             lines = output.strip().split('\n')
             for line in lines:
                 line = line.strip()
-                if line and not line.startswith('codex>'):
+                if line and not line.startswith('claude1>'):
                     print(line)
         else:
-            print("⚠️  No response from Claude-1 (timeout after 30s)")
+            print("⚠️  No response from Claude-1 (timeout after 20s)")
     
     def _send_to_claude2(self, command: str):
         """从 Claude-1 向 Claude-2 发送命令"""
@@ -785,11 +785,11 @@ NOTES:
             return
 
         # 等待 Claude-2 处理（AI 模型需要更长时间生成响应）
-        time.sleep(1.5)
+        time.sleep(2.0)
 
         # 读取 Claude-2 的输出
         output = ""
-        max_wait = 30  # 最多等待 30 秒
+        max_wait = 9  # 最多等待约 20 秒（2秒初始 + 9次 * 2秒）
         for i in range(max_wait):
             chunk = self.claude2.read_output(timeout=3.0)
             if chunk:
@@ -797,13 +797,13 @@ NOTES:
                 output += chunk
                 # 如果收到内容，继续读取一段时间以确保获取完整响应
                 if i < max_wait - 1:
-                    time.sleep(0.3)
+                    time.sleep(0.5)
             else:
                 # 如果已经有输出且连续没有新内容，停止等待
                 if output.strip():
                     self.logger.debug(f"No more Claude content after {i+1} attempts, stopping")
                     break
-                time.sleep(3.0)
+                time.sleep(2.0)
 
         self.logger.debug(f"Total Claude output received: {len(output)} bytes")
 
@@ -817,7 +817,7 @@ NOTES:
                     print(line)
             print("-" * 50)
         else:
-            print("⚠️  No response from Claude-2 (timeout after 30s)")
+            print("⚠️  No response from Claude-2 (timeout after 20s)")
 
         if self.claude1:
             print("\n继续 Claude-1 会话...\n")
