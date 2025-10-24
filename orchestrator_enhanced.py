@@ -264,6 +264,9 @@ class CLIAgent:
             output = self.output_buffer
             self.output_buffer = ""  # 清空 buffer
 
+        if output:
+            self.logger.debug(f"read_output: Got {len(output)} bytes from buffer")
+
         # 如果 PTY 已关闭，只返回 buffer 中剩余的内容
         if self.pty_closed:
             return output
@@ -286,6 +289,7 @@ class CLIAgent:
                         if chunk:
                             decoded = chunk.decode('utf-8', errors='replace')
                             output += decoded
+                            self.logger.debug(f"read_output: Read {len(chunk)} bytes from PTY")
                         # 不要在这里设置 process_running = False
                         # 空 chunk 不一定意味着进程退出
                     except OSError as e:
@@ -314,6 +318,11 @@ class CLIAgent:
             import re
             # 保留可打印字符和换行符，删除 ANSI 转义序列
             output = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', output)
+
+        if output:
+            self.logger.debug(f"read_output: Returning {len(output)} bytes total")
+        else:
+            self.logger.debug(f"read_output: No output to return")
 
         return output
     
@@ -746,8 +755,9 @@ NOTES:
         output = ""
         max_wait = 30  # 最多等待 30 秒
         for i in range(max_wait):
-            chunk = self.codex.read_output(timeout=0.5)
+            chunk = self.codex.read_output(timeout=3.0)
             if chunk:
+                self.logger.debug(f"Received chunk {i+1}: {len(chunk)} bytes")
                 output += chunk
                 # 如果收到内容，继续读取一段时间以确保获取完整响应
                 if i < max_wait - 1:
@@ -755,8 +765,11 @@ NOTES:
             else:
                 # 如果已经有输出且连续没有新内容，停止等待
                 if output.strip():
+                    self.logger.debug(f"No more content after {i+1} attempts, stopping")
                     break
-                time.sleep(0.5)
+                time.sleep(3.0)
+
+        self.logger.debug(f"Total output received: {len(output)} bytes")
 
         if output.strip():
             # 过滤回显和提示符
@@ -787,8 +800,9 @@ NOTES:
         output = ""
         max_wait = 30  # 最多等待 30 秒
         for i in range(max_wait):
-            chunk = self.claude.read_output(timeout=0.5)
+            chunk = self.claude.read_output(timeout=3.0)
             if chunk:
+                self.logger.debug(f"Received Claude chunk {i+1}: {len(chunk)} bytes")
                 output += chunk
                 # 如果收到内容，继续读取一段时间以确保获取完整响应
                 if i < max_wait - 1:
@@ -796,8 +810,11 @@ NOTES:
             else:
                 # 如果已经有输出且连续没有新内容，停止等待
                 if output.strip():
+                    self.logger.debug(f"No more Claude content after {i+1} attempts, stopping")
                     break
-                time.sleep(0.5)
+                time.sleep(3.0)
+
+        self.logger.debug(f"Total Claude output received: {len(output)} bytes")
 
         if output.strip():
             print("\n🔵 Claude Code Output:")
