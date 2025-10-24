@@ -178,6 +178,29 @@ class CLIAgent:
                 except OSError as e:
                     self.logger.debug(f"{self.name}: Could not send initial newline: {e}")
 
+                # 对于 codex，发送一个初始命令来保持它活跃
+                if self.cli_command == 'codex':
+                    self.logger.debug(f"{self.name}: Sending initial command to keep it active")
+                    time.sleep(0.5)  # 稍等片刻
+                    try:
+                        # 发送 /status 命令
+                        os.write(self.fd, b'/status\n')
+                        time.sleep(0.5)
+
+                        # 读取响应
+                        try:
+                            status_response = os.read(self.fd, 8192)
+                            if status_response:
+                                decoded = status_response.decode('utf-8', errors='replace')
+                                initial_output += decoded
+                                self.output_buffer += decoded
+                                self.logger.debug(f"{self.name}: Got status response: {len(decoded)} bytes")
+                        except OSError as e:
+                            if e.errno not in (5, 11, 35):  # 忽略 EIO, EAGAIN
+                                self.logger.debug(f"{self.name}: Error reading status response: {e}")
+                    except OSError as e:
+                        self.logger.debug(f"{self.name}: Could not send status command: {e}")
+
             self.process_running = True
             self.logger.info(f"✅ Started {self.name} (PID: {self.pid})")
 
