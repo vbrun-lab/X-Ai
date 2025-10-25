@@ -30,11 +30,11 @@ agents:
       enabled: false  # Claude 不需要心跳
       interval: 10  # 心跳间隔（秒）
 
-  # Claude-2 配置
+  # Claude-2 配置 (使用 Gemini)
   - name: "claude-2"
-    command: "claude"
+    command: "gemini"
     enabled: true
-    description: "Secondary Claude instance for collaboration"
+    description: "Gemini instance for collaboration"
 
     startup:
       timeout: 20
