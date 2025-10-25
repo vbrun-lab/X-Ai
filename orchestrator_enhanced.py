@@ -575,6 +575,10 @@ class InteractiveSession:
             self.session_manager = None
             if enable_history and not CONFIG_AVAILABLE:
                 self.logger.warning("⚠️  对话历史模块不可用")
+
+        # AI 自动编排
+        self.auto_orchestration = True  # 默认启用自动编排
+        self.max_orchestration_loops = 10  # 最大循环次数，防止死循环
     
     def show_help(self):
         """显示帮助信息"""
@@ -606,6 +610,12 @@ CONVERSATION HISTORY COMMANDS (对话历史):
   /export <filename>   导出对话历史为 Markdown
   /stats               显示对话统计信息
 
+AI AUTO-ORCHESTRATION (AI自动编排):
+  直接输入复杂任务，Claude-1 会自动调用 Claude-2 协作
+  Claude-1 使用 @claude-2: <任务> 来调用 Claude-2
+  任务完成时会输出 [COMPLETE] 标记
+  /auto on|off         开启或关闭自动编排模式
+
 WORKFLOW EXAMPLE:
   codex> write a python function
   [Claude-1 思考...并可能调用 Claude-2]
@@ -623,7 +633,212 @@ NOTES:
   - 架构支持未来添加更多 AI (Gemini etc.)
 """
         print(help_text)
-    
+
+    def _parse_agent_call(self, output: str) -> Optional[Tuple[str, str]]:
+        """
+        解析 AI 输出，检测是否调用其他 Agent
+
+        Returns:
+            (agent_name, task) 或 None
+        """
+        import re
+
+        # 匹配 @agent-name: task
+        pattern = r'@(claude-\d+|codex|gemini):\s*(.+?)(?=\n@|\n\[|$)'
+        match = re.search(pattern, output, re.DOTALL)
+
+        if match:
+            agent_name = match.group(1)
+            task = match.group(2).strip()
+            return (agent_name, task)
+
+        return None
+
+    def _is_complete(self, output: str) -> bool:
+        """检测任务是否完成"""
+        return '[COMPLETE]' in output or '[DONE]' in output
+
+    def _extract_final_result(self, output: str) -> str:
+        """提取最终结果"""
+        if '[COMPLETE]' in output:
+            parts = output.split('[COMPLETE]', 1)
+            if len(parts) > 1:
+                return parts[1].strip()
+        elif '[DONE]' in output:
+            parts = output.split('[DONE]', 1)
+            if len(parts) > 1:
+                return parts[1].strip()
+        return output
+
+    def _send_to_claude1_with_orchestration(self, command: str):
+        """
+        向 Claude-1 发送命令，支持自动编排
+        Claude-1 可以通过 @claude-2 自动调用 Claude-2
+        """
+        if not self.claude1 or not self.claude1.is_running():
+            print("❌ Claude-1 is not available")
+            return
+
+        # 记录用户消息
+        if self.history_enabled:
+            self.history.add_user_message(command)
+
+        # 构建初始提示（包含系统指令）
+        if self.auto_orchestration:
+            system_instruction = """
+[SYSTEM] 你是一个 AI 编排器。你可以调用 Claude-2 协助完成任务：
+- 使用 @claude-2: <任务> 来调用
+- 完成后输出 [COMPLETE] 标记
+
+"""
+            initial_command = system_instruction + command
+        else:
+            initial_command = command
+
+        print(f"→ Sending to Claude-1: {command}")
+        print("🔄 自动编排模式已启用\n")
+
+        # 开始编排循环
+        loop_count = 0
+        current_agent = self.claude1
+        current_command = initial_command
+
+        while loop_count < self.max_orchestration_loops:
+            loop_count += 1
+            self.logger.debug(f"Orchestration loop {loop_count}")
+
+            # 发送命令
+            if not current_agent.send_command(current_command):
+                print("❌ Failed to send command")
+                break
+
+            # 等待响应
+            time.sleep(2.0)
+
+            # 读取输出
+            output = ""
+            deadline = time.time() + 45.0
+            idle_checks = 0
+            max_idle_checks = 3
+
+            while time.time() < deadline and idle_checks < max_idle_checks:
+                chunk = current_agent.read_output(timeout=3.0)
+                if chunk:
+                    output += chunk
+                    idle_checks = 0
+                    time.sleep(0.5)
+                else:
+                    idle_checks += 1
+                    time.sleep(2.0 if not output.strip() else 1.0)
+
+            if not output.strip():
+                print("⚠️  No response")
+                break
+
+            # 清理输出
+            normalized = output.replace('\r\n', '\n').replace('\r', '\n')
+            lines = normalized.split('\n')
+            cleaned_lines = self._clean_output_lines(current_command, lines, current_agent.name)
+            cleaned_output = '\n'.join(cleaned_lines) if cleaned_lines else output
+
+            # 记录响应
+            if self.history_enabled:
+                self.history.add_agent_message(current_agent.name, cleaned_output)
+
+            # 显示输出
+            print(f"\n{'='*60}")
+            print(f"📤 {current_agent.name} 响应:")
+            print(f"{'='*60}")
+            for line in cleaned_lines[:50]:  # 限制显示行数
+                print(line)
+            if len(cleaned_lines) > 50:
+                print(f"... (还有 {len(cleaned_lines) - 50} 行)")
+            print(f"{'='*60}\n")
+
+            # 检测是否完成
+            if self._is_complete(cleaned_output):
+                final_result = self._extract_final_result(cleaned_output)
+                print("\n✅ 任务完成！\n")
+                print(f"{'='*60}")
+                print("🎯 最终结果:")
+                print(f"{'='*60}")
+                print(final_result)
+                print(f"{'='*60}\n")
+                break
+
+            # 检测是否调用其他 Agent
+            agent_call = self._parse_agent_call(cleaned_output)
+            if agent_call:
+                target_agent_name, task = agent_call
+                print(f"\n🔵 检测到调用: {target_agent_name}")
+                print(f"   任务: {task[:100]}{'...' if len(task) > 100 else ''}\n")
+
+                # 路由到目标 Agent
+                if target_agent_name == 'claude-2' and self.claude2:
+                    target_agent = self.claude2
+
+                    # 记录调用
+                    if self.history_enabled:
+                        self.history.add_system_message(f"Claude-1 调用 Claude-2: {task[:100]}")
+
+                    # 发送给 Claude-2
+                    if not target_agent.send_command(task):
+                        print("❌ Failed to call Claude-2")
+                        break
+
+                    # 等待 Claude-2 响应
+                    time.sleep(2.0)
+                    claude2_output = ""
+                    deadline2 = time.time() + 45.0
+                    idle_checks2 = 0
+
+                    while time.time() < deadline2 and idle_checks2 < 3:
+                        chunk2 = target_agent.read_output(timeout=3.0)
+                        if chunk2:
+                            claude2_output += chunk2
+                            idle_checks2 = 0
+                            time.sleep(0.5)
+                        else:
+                            idle_checks2 += 1
+                            time.sleep(1.0)
+
+                    # 清理 Claude-2 输出
+                    normalized2 = claude2_output.replace('\r\n', '\n').replace('\r', '\n')
+                    lines2 = normalized2.split('\n')
+                    cleaned_lines2 = self._clean_output_lines(task, lines2, 'claude-2')
+                    cleaned_output2 = '\n'.join(cleaned_lines2) if cleaned_lines2 else claude2_output
+
+                    # 记录 Claude-2 响应
+                    if self.history_enabled:
+                        self.history.add_agent_message('claude-2', cleaned_output2)
+
+                    # 显示 Claude-2 输出
+                    print(f"\n{'='*60}")
+                    print(f"📥 Claude-2 响应:")
+                    print(f"{'='*60}")
+                    for line in cleaned_lines2[:30]:
+                        print(line)
+                    if len(cleaned_lines2) > 30:
+                        print(f"... (还有 {len(cleaned_lines2) - 30} 行)")
+                    print(f"{'='*60}\n")
+
+                    # 把 Claude-2 的响应发回给 Claude-1
+                    print("🔄 将响应返回给 Claude-1...\n")
+                    current_agent = self.claude1
+                    current_command = f"Claude-2 的响应：\n\n{cleaned_output2}\n\n请继续处理。"
+
+                else:
+                    print(f"⚠️  Agent {target_agent_name} not available")
+                    break
+            else:
+                # 没有检测到调用，也没有完成标记
+                print("\n⚠️  Claude-1 没有标记任务完成，也没有调用其他 Agent")
+                print("   可能需要手动继续...\n")
+                break
+
+        if loop_count >= self.max_orchestration_loops:
+            print(f"\n⚠️  达到最大循环次数 ({self.max_orchestration_loops})，停止编排")
+
     def _start_monitoring(self):
         """启动后台监听线程（监控输出和进程状态）"""
         # 跟踪已知的进程状态
@@ -750,9 +965,12 @@ NOTES:
                         command = user_input[1:].strip() if user_input.startswith('>') else user_input
                         self._send_to_claude2(command)
 
-                    # 正常输入发送给 Claude-1
+                    # 正常输入发送给 Claude-1（使用自动编排模式）
                     elif self.claude1:
-                        self._send_to_claude1(user_input)
+                        if self.auto_orchestration:
+                            self._send_to_claude1_with_orchestration(user_input)
+                        else:
+                            self._send_to_claude1(user_input)
                     else:
                         print("⚠️  No agent available to handle this command")
 
@@ -811,6 +1029,25 @@ NOTES:
 
         elif cmd_name == '/stats':
             self._handle_stats_command()
+
+        # 自动编排命令
+        elif cmd_name == '/auto':
+            if len(parts) < 2:
+                status = "启用" if self.auto_orchestration else "禁用"
+                print(f"自动编排模式: {status}")
+                print("用法: /auto on|off")
+            else:
+                mode = parts[1].lower()
+                if mode == 'on':
+                    self.auto_orchestration = True
+                    print("✅ 自动编排模式已启用")
+                    print("   Claude-1 现在可以自动调用 Claude-2")
+                elif mode == 'off':
+                    self.auto_orchestration = False
+                    print("❌ 自动编排模式已禁用")
+                    print("   需要手动使用 > claude-2 调用")
+                else:
+                    print("❌ 无效参数，使用: /auto on 或 /auto off")
 
         else:
             print(f"Unknown command: {cmd_name}")
