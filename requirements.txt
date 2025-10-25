@@ -1,0 +1,21 @@
+# X-Ai Orchestrator - Python 依赖
+# 版本: 1.0.2
+
+# YAML 配置文件支持
+pyyaml>=5.4
+
+# 其他依赖（Python 标准库，无需额外安装）
+# - os
+# - sys
+# - logging
+# - threading
+# - json
+# - time
+# - pathlib
+# - dataclasses
+# - collections
+
+# 可选依赖（未来功能）
+# fastapi>=0.100.0  # Web UI
+# websockets>=11.0  # 实时通信
+# uvicorn>=0.23.0   # ASGI 服务器

@@ -2,7 +2,7 @@
 
 > 一个强大的AI协同编排系统，让多个AI CLI工具无缝协作
 
-[![Version](https://img.shields.io/badge/version-1.0.1-blue.svg)](https://github.com/vbrun-lab/X-Ai/releases)
+[![Version](https://img.shields.io/badge/version-1.0.2-blue.svg)](https://github.com/vbrun-lab/X-Ai/releases)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.8+-yellow.svg)](https://www.python.org/)
 
@@ -12,6 +12,9 @@
 - **智能编排** - 通过简单的 `>` 符号在不同AI之间转发命令
 - **会话保持** - 所有AI进程常驻内存，保持上下文连续性
 - **实时通信** - 基于PTY的双向通信，无延迟无丢包
+- **配置文件支持** - YAML配置文件，灵活管理Agent参数
+- **对话历史** - 自动记录所有对话，支持保存、加载和搜索
+- **多轮对话** - 完整的上下文管理，支持会话恢复
 - **易于扩展** - 模块化设计，轻松添加新的AI工具
 - **完整日志** - 详细的日志记录，便于调试和监控
 
@@ -37,6 +40,13 @@ which codex
 which claude
 ```
 
+### 安装依赖
+
+```bash
+# 安装 Python 依赖
+pip3 install -r requirements.txt
+```
+
 ### 启动系统
 
 ```bash
@@ -46,8 +56,14 @@ bash start_minimal.sh
 # 方法2: 直接运行Python脚本
 python3 orchestrator_enhanced.py
 
-# 方法3: 简化版本
-python3 orchestrator_enhanced.py simple
+# 方法3: 使用自定义配置文件
+python3 orchestrator_enhanced.py --config my_config.yaml
+
+# 方法4: 启用调试模式
+python3 orchestrator_enhanced.py --debug
+
+# 方法5: 禁用对话历史
+python3 orchestrator_enhanced.py --no-history
 ```
 
 ### 基本使用
@@ -128,6 +144,61 @@ codex> /exit
 
 ## 高级功能
 
+### 配置文件
+
+系统支持通过 YAML 配置文件自定义行为。创建 `config.yaml`：
+
+```yaml
+# Agent 配置
+agents:
+  - name: "claude-1"
+    command: "claude"
+    enabled: true
+    startup:
+      timeout: 20  # 启动超时（秒）
+    response:
+      timeout: 45  # 响应超时（秒）
+
+# 对话历史配置
+conversation:
+  history:
+    enabled: true
+    max_entries: 1000
+    save_to_file: true
+
+# 更多配置选项见 config.yaml
+```
+
+### 对话历史管理
+
+所有对话自动记录，支持多种操作：
+
+```bash
+# 查看最近10条对话
+/history
+
+# 查看最近20条对话
+/history 20
+
+# 搜索包含关键词的对话
+/history search "python function"
+
+# 保存当前会话
+/save my_session
+
+# 加载历史会话
+/load my_session
+
+# 列出所有会话
+/sessions
+
+# 导出为Markdown
+/export conversation.md
+
+# 查看统计信息
+/stats
+```
+
 ### 多轮对话
 
 ```bash
@@ -142,6 +213,8 @@ codex> > claude suggest improvements
 
 codex> implement the suggestions
 [Codex 实现改进...]
+
+# 所有对话自动记录，可随时使用 /history 查看
 ```
 
 ### 添加新的AI工具
@@ -177,6 +250,16 @@ codex> > gemini analyze this algorithm
 
 ## 版本历史
 
+### v1.0.2 (2025-10-25)
+- ✨ 新增配置文件支持（YAML格式）
+- ✨ 新增对话历史记录和管理功能
+- ✨ 新增多轮对话上下文保持
+- ✨ 新增会话保存和加载功能
+- ✨ 新增对话搜索和导出功能
+- 📦 添加requirements.txt依赖管理
+- 📚 更新文档和使用指南
+- 🎯 新增命令：/history, /save, /load, /sessions, /export, /stats
+
 ### v1.0.1 (2025-10-25)
 - 改进Claude输出处理逻辑
 - 扩展所有超时参数以更好处理AI响应
@@ -199,12 +282,21 @@ codex> > gemini analyze this algorithm
 
 ## 开发路线图
 
-- [ ] 添加Web UI仪表板
+### 已完成 ✅
+- [x] 添加配置文件支持 (v1.0.2)
+- [x] 实现命令历史和会话恢复 (v1.0.2)
+- [x] 多轮对话上下文管理 (v1.0.2)
+
+### 进行中 🚧
 - [ ] 支持更多AI工具（Gemini, GPT-4等）
-- [ ] 实现MCP (Model Context Protocol)集成
-- [ ] 添加配置文件支持
-- [ ] 实现命令历史和会话恢复
 - [ ] 性能优化和并发处理
+
+### 计划中 📋
+- [ ] 添加Web UI仪表板
+- [ ] 实现MCP (Model Context Protocol)集成
+- [ ] 智能Agent路由和负载均衡
+- [ ] 插件系统
+- [ ] 云部署支持
 
 ## 贡献
 

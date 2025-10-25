@@ -1,0 +1,149 @@
+# X-Ai Orchestrator Configuration
+# Version: 1.0.2
+
+# 配置文件版本
+version: "1.0.2"
+
+# Agent 配置
+agents:
+  # Claude-1 配置
+  - name: "claude-1"
+    command: "claude"
+    enabled: true
+    description: "Primary Claude instance"
+
+    # 启动配置
+    startup:
+      timeout: 20  # 启动超时时间（秒），保持足够长以确保完整启动
+      wait_after_start: 2.0  # 启动后额外等待时间
+      initial_read_attempts: 30  # 初始输出读取尝试次数
+
+    # 响应配置
+    response:
+      timeout: 45  # 命令响应超时（秒）
+      read_timeout: 3.0  # 单次读取超时
+      max_idle_checks: 3  # 最大空闲检查次数
+      idle_wait: 2.0  # 空闲等待时间
+
+    # 心跳配置（保持 codex 等需要心跳的 CLI 活跃）
+    heartbeat:
+      enabled: false  # Claude 不需要心跳
+      interval: 10  # 心跳间隔（秒）
+
+  # Claude-2 配置
+  - name: "claude-2"
+    command: "claude"
+    enabled: true
+    description: "Secondary Claude instance for collaboration"
+
+    startup:
+      timeout: 20
+      wait_after_start: 2.0
+      initial_read_attempts: 30
+
+    response:
+      timeout: 45
+      read_timeout: 3.0
+      max_idle_checks: 3
+      idle_wait: 2.0
+
+    heartbeat:
+      enabled: false
+      interval: 10
+
+# Orchestrator 配置
+orchestrator:
+  # 日志配置
+  logging:
+    level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+    file: "orchestrator.log"
+    format: "[%(asctime)s] %(name)s: %(message)s"
+
+  # 监控配置
+  monitoring:
+    enabled: true
+    interval: 10  # 监控间隔（秒）
+    check_process_status: true
+
+  # 进程管理
+  process:
+    graceful_shutdown_timeout: 2  # 优雅关闭超时
+    force_kill_after: 5  # 强制终止前等待时间
+
+# 对话历史配置
+conversation:
+  # 历史记录
+  history:
+    enabled: true
+    max_entries: 1000  # 内存中保留的最大对话条数
+    save_to_file: true
+    file_path: "conversations/history.json"
+
+  # 会话管理
+  session:
+    auto_save: true
+    save_interval: 60  # 自动保存间隔（秒）
+    session_dir: "conversations/sessions"
+
+  # 上下文配置
+  context:
+    max_context_messages: 20  # Agent 间共享的最大上下文消息数
+    include_timestamps: true
+    include_agent_info: true
+
+# 输出处理配置
+output:
+  # 过滤配置
+  filtering:
+    remove_ansi: true  # 移除 ANSI 转义序列
+    remove_noise: true  # 移除 CLI UI 噪声
+    noise_keywords:
+      - "? for shortcuts"
+      - "thinking on"
+      - "approaching weekly limit"
+      - "ctrl-g to edit"
+      - "ctrl+o to show"
+      - "billowing…"
+      - "marinating…"
+      - "thinking…"
+      - "thought for"
+      - "esc to interrupt"
+      - "weekly limit"
+
+  # 显示配置
+  display:
+    max_lines: 100  # 显示的最大行数（0=无限制）
+    show_timestamps: false
+    show_agent_name: true
+    color_output: true
+
+# 交互界面配置
+interface:
+  prompt:
+    claude1: "claude1> "
+    claude2: "claude2> "
+    default: "> "
+
+  commands:
+    prefix: "/"  # 特殊命令前缀
+
+  help:
+    show_on_start: false
+    show_available_agents: true
+
+# 高级功能（预留）
+advanced:
+  # MCP 集成（未来功能）
+  mcp:
+    enabled: false
+    server_port: 8080
+
+  # Web UI（未来功能）
+  web_ui:
+    enabled: false
+    port: 3000
+
+  # 并发执行（未来功能）
+  parallel:
+    enabled: false
+    max_concurrent: 3

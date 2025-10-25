@@ -19,9 +19,21 @@ import select
 import fcntl
 import subprocess
 from pathlib import Path
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, Optional, Tuple, List, Any
 import logging
 import threading
+
+# 导入配置和对话历史模块
+try:
+    from config_loader import ConfigLoader, get_config
+    from conversation_history import ConversationHistory, SessionManager
+    CONFIG_AVAILABLE = True
+except ImportError as e:
+    logging.warning(f"配置模块未找到，使用默认设置: {e}")
+    CONFIG_AVAILABLE = False
+    ConfigLoader = None
+    ConversationHistory = None
+    SessionManager = None
 
 # 配置日志
 logging.basicConfig(
@@ -37,15 +49,17 @@ logger = logging.getLogger('orchestrator')
 
 class CLIAgent:
     """管理单个 CLI 的进程和 PTY"""
-    
-    def __init__(self, name: str, cli_command: str):
+
+    def __init__(self, name: str, cli_command: str, config: Optional[Dict[str, Any]] = None):
         """
         Args:
             name: Agent 名称（如 'codex', 'claude-code'）
             cli_command: 启动命令（如 'codex' 或 'claude'）
+            config: Agent 配置字典（可选）
         """
         self.name = name
         self.cli_command = cli_command
+        self.config = config or {}
 
         self.pid: Optional[int] = None
         self.fd: Optional[int] = None  # PTY master fd
@@ -447,15 +461,22 @@ class Orchestrator:
         self.shutdown()
         sys.exit(0)
     
-    def register_agent(self, name: str, cli_command: str) -> bool:
-        """注册新 Agent（为未来扩展留好接口）"""
+    def register_agent(self, name: str, cli_command: str, config: Optional[Dict[str, Any]] = None) -> bool:
+        """
+        注册新 Agent（为未来扩展留好接口）
+
+        Args:
+            name: Agent 名称
+            cli_command: CLI 命令
+            config: Agent 配置字典（可选）
+        """
         if name in self.agents:
             self.logger.warning(f"Agent {name} already registered")
             return False
-        
-        agent = CLIAgent(name=name, cli_command=cli_command)
+
+        agent = CLIAgent(name=name, cli_command=cli_command, config=config)
         self.agents[name] = agent
-        
+
         self.logger.info(f"Registered agent: {name}")
         return True
     
@@ -519,8 +540,8 @@ class Orchestrator:
 
 class InteractiveSession:
     """与 Claude-1 的交互式会话，支持 Claude-1 驱动 Claude-2"""
-    
-    def __init__(self, orchestrator: Orchestrator):
+
+    def __init__(self, orchestrator: Orchestrator, enable_history: bool = True):
         self.orchestrator = orchestrator
         self.claude1 = orchestrator.get_agent("claude-1")
         self.claude2 = orchestrator.get_agent("claude-2")
@@ -542,6 +563,18 @@ class InteractiveSession:
         # 监听线程
         self.monitor_thread = None
         self.monitoring = True
+
+        # 对话历史
+        self.history_enabled = enable_history and CONFIG_AVAILABLE and ConversationHistory
+        if self.history_enabled:
+            self.history = ConversationHistory(max_entries=1000)
+            self.session_manager = SessionManager()
+            self.logger.info("✅ 对话历史已启用")
+        else:
+            self.history = None
+            self.session_manager = None
+            if enable_history and not CONFIG_AVAILABLE:
+                self.logger.warning("⚠️  对话历史模块不可用")
     
     def show_help(self):
         """显示帮助信息"""
@@ -557,12 +590,21 @@ INTERACTIVE MODE:
 SPECIAL COMMANDS (在 Claude-1 中执行):
   > claude [command]   向 Claude-2 发送命令
   例: > claude optimize the previous code
-  
+
   /status              显示 Agent 状态
   /claude_output       查看 Claude-2 的最新输出
   /clear               清屏
   /help                显示此帮助
   /exit                退出
+
+CONVERSATION HISTORY COMMANDS (对话历史):
+  /history [n]         显示最近 n 条对话（默认 10 条）
+  /history search <keyword>  搜索包含关键词的对话
+  /save [name]         保存当前会话
+  /load <name>         加载历史会话
+  /sessions            列出所有已保存的会话
+  /export <filename>   导出对话历史为 Markdown
+  /stats               显示对话统计信息
 
 WORKFLOW EXAMPLE:
   codex> write a python function
@@ -725,26 +767,54 @@ NOTES:
     
     def _handle_command(self, cmd: str):
         """处理特殊命令"""
-        cmd = cmd.lower().strip()
-        
-        if cmd == '/help':
+        cmd_lower = cmd.lower().strip()
+        parts = cmd.strip().split(maxsplit=1)
+        cmd_name = parts[0].lower()
+
+        if cmd_name == '/help':
             self.show_help()
-        
-        elif cmd == '/status':
+
+        elif cmd_name == '/status':
             self.orchestrator.show_status()
-        
-        elif cmd == '/claude_output':
+
+        elif cmd_name == '/claude_output':
             self._show_claude_output()
-        
-        elif cmd == '/clear':
+
+        elif cmd_name == '/clear':
             os.system('clear' if os.name == 'posix' else 'cls')
-        
-        elif cmd == '/exit':
+
+        elif cmd_name == '/exit':
             print("Exiting...")
             sys.exit(0)
-        
+
+        # 对话历史命令
+        elif cmd_name == '/history':
+            self._handle_history_command(parts[1] if len(parts) > 1 else '')
+
+        elif cmd_name == '/save':
+            self._handle_save_command(parts[1] if len(parts) > 1 else None)
+
+        elif cmd_name == '/load':
+            if len(parts) < 2:
+                print("❌ 用法: /load <session_name>")
+            else:
+                self._handle_load_command(parts[1])
+
+        elif cmd_name == '/sessions':
+            self._handle_sessions_command()
+
+        elif cmd_name == '/export':
+            if len(parts) < 2:
+                print("❌ 用法: /export <filename>")
+            else:
+                self._handle_export_command(parts[1])
+
+        elif cmd_name == '/stats':
+            self._handle_stats_command()
+
         else:
-            print(f"Unknown command: {cmd}")
+            print(f"Unknown command: {cmd_name}")
+            print("Type '/help' for available commands")
     
     def _clean_output_lines(self, command: str, lines: List[str], agent_label: str) -> List[str]:
         """过滤掉 CLI UI 噪声，只保留有效内容"""
@@ -823,6 +893,10 @@ NOTES:
             print("❌ Claude-1 is not available")
             return
 
+        # 记录用户消息到历史
+        if self.history_enabled:
+            self.history.add_user_message(command)
+
         print(f"→ Sending to Claude-1: {command}")
 
         if not self.claude1.send_command(command):
@@ -869,6 +943,12 @@ NOTES:
             cleaned_lines = self._clean_output_lines(command, lines, 'claude1')
 
             if cleaned_lines:
+                response_text = '\n'.join(cleaned_lines)
+
+                # 记录 Agent 响应到历史
+                if self.history_enabled:
+                    self.history.add_agent_message('claude-1', response_text)
+
                 for line in cleaned_lines:
                     print(line)
             else:
@@ -881,6 +961,10 @@ NOTES:
         if not self.claude2 or not self.claude2.is_running():
             print("❌ Claude-2 is not available")
             return
+
+        # 记录用户消息到历史（发送给 Claude-2）
+        if self.history_enabled:
+            self.history.add_user_message(f"> claude {command}")
 
         print(f"\n🔵 Claude-2 ← Sending: {command}")
 
@@ -927,6 +1011,12 @@ NOTES:
             filtered = self._clean_output_lines(command, lines, 'claude2')
 
             if filtered:
+                response_text = '\n'.join(filtered[-20:])
+
+                # 记录 Claude-2 响应到历史
+                if self.history_enabled:
+                    self.history.add_agent_message('claude-2', response_text)
+
                 print("\n🔵 Claude-2 Output:")
                 print("-" * 50)
                 for line in filtered[-20:]:
@@ -957,6 +1047,164 @@ NOTES:
         else:
             print("(No recent output from Claude-2)")
 
+    def _handle_history_command(self, args: str):
+        """处理 /history 命令"""
+        if not self.history_enabled:
+            print("❌ 对话历史功能未启用")
+            return
+
+        args = args.strip()
+
+        # /history search <keyword>
+        if args.startswith('search '):
+            keyword = args[7:].strip()
+            if not keyword:
+                print("❌ 请提供搜索关键词")
+                return
+
+            results = self.history.search(keyword, limit=20)
+            if not results:
+                print(f"未找到包含 '{keyword}' 的对话")
+                return
+
+            print(f"\n搜索结果 ('{keyword}'):")
+            print("=" * 60)
+            for msg in results:
+                timestamp = msg.format_timestamp('%H:%M:%S')
+                role_icon = {'user': '👤', 'agent': '🤖', 'system': 'ℹ️'}.get(msg.role, '•')
+                agent_info = f" [{msg.agent_name}]" if msg.agent_name else ""
+                print(f"{role_icon} [{timestamp}]{agent_info} {msg.content[:80]}")
+            print("=" * 60 + "\n")
+
+        # /history [n]
+        else:
+            try:
+                count = int(args) if args else 10
+                count = max(1, min(count, 100))  # 限制在 1-100 之间
+            except ValueError:
+                print("❌ 无效的数字")
+                return
+
+            messages = self.history.get_recent_messages(count)
+            if not messages:
+                print("暂无对话历史")
+                return
+
+            print(f"\n最近 {len(messages)} 条对话:")
+            print("=" * 60)
+            for msg in messages:
+                timestamp = msg.format_timestamp('%H:%M:%S')
+                role_icon = {'user': '👤', 'agent': '🤖', 'system': 'ℹ️'}.get(msg.role, '•')
+                agent_info = f" [{msg.agent_name}]" if msg.agent_name else ""
+                print(f"{role_icon} [{timestamp}]{agent_info}")
+                print(f"  {msg.content[:200]}")
+                if len(msg.content) > 200:
+                    print(f"  ... (共 {len(msg.content)} 字符)")
+                print()
+            print("=" * 60 + "\n")
+
+    def _handle_save_command(self, name: Optional[str]):
+        """处理 /save 命令"""
+        if not self.history_enabled:
+            print("❌ 对话历史功能未启用")
+            return
+
+        if not name:
+            name = f"session_{int(time.time())}"
+
+        try:
+            file_path = self.session_manager.save_session(self.history, name)
+            print(f"✅ 会话已保存: {file_path}")
+        except Exception as e:
+            print(f"❌ 保存会话失败: {e}")
+
+    def _handle_load_command(self, name: str):
+        """处理 /load 命令"""
+        if not self.history_enabled:
+            print("❌ 对话历史功能未启用")
+            return
+
+        try:
+            loaded_history = self.session_manager.load_session(name)
+            if loaded_history:
+                self.history = loaded_history
+                stats = self.history.get_stats()
+                print(f"✅ 已加载会话: {name}")
+                print(f"   消息数: {stats['messages_in_memory']}")
+                print(f"   会话 ID: {stats['session_id']}")
+            else:
+                print(f"❌ 无法加载会话: {name}")
+        except Exception as e:
+            print(f"❌ 加载会话失败: {e}")
+
+    def _handle_sessions_command(self):
+        """处理 /sessions 命令"""
+        if not self.history_enabled:
+            print("❌ 对话历史功能未启用")
+            return
+
+        try:
+            sessions = self.session_manager.list_sessions()
+            if not sessions:
+                print("暂无已保存的会话")
+                return
+
+            print(f"\n已保存的会话 ({len(sessions)} 个):")
+            print("=" * 80)
+            for session in sessions:
+                from datetime import datetime
+                start_time = datetime.fromtimestamp(session['start_time']).strftime('%Y-%m-%d %H:%M:%S')
+                modified_time = datetime.fromtimestamp(session['modified_time']).strftime('%Y-%m-%d %H:%M:%S')
+                size_kb = session['file_size'] / 1024
+
+                print(f"📁 {session['filename']}")
+                print(f"   会话 ID: {session['session_id']}")
+                print(f"   开始时间: {start_time}")
+                print(f"   修改时间: {modified_time}")
+                print(f"   消息数: {session['message_count']}")
+                print(f"   文件大小: {size_kb:.1f} KB")
+                print()
+            print("=" * 80 + "\n")
+        except Exception as e:
+            print(f"❌ 列出会话失败: {e}")
+
+    def _handle_export_command(self, filename: str):
+        """处理 /export 命令"""
+        if not self.history_enabled:
+            print("❌ 对话历史功能未启用")
+            return
+
+        if not filename.endswith('.md'):
+            filename += '.md'
+
+        try:
+            if self.history.export_to_markdown(filename):
+                print(f"✅ 对话历史已导出: {filename}")
+            else:
+                print(f"❌ 导出失败")
+        except Exception as e:
+            print(f"❌ 导出失败: {e}")
+
+    def _handle_stats_command(self):
+        """处理 /stats 命令"""
+        if not self.history_enabled:
+            print("❌ 对话历史功能未启用")
+            return
+
+        stats = self.history.get_stats()
+        duration_minutes = stats['session_duration'] / 60
+
+        print("\n📊 对话统计:")
+        print("=" * 50)
+        print(f"  会话 ID: {stats['session_id']}")
+        print(f"  会话时长: {duration_minutes:.1f} 分钟")
+        print(f"  总消息数: {stats['total_messages']}")
+        print(f"  - 用户消息: {stats['user_messages']}")
+        print(f"  - Agent 消息: {stats['agent_messages']}")
+        print(f"  - 系统消息: {stats['system_messages']}")
+        print(f"  内存中消息: {stats['messages_in_memory']}")
+        print("=" * 50 + "\n")
+
 
 def main():
     """主函数"""
@@ -969,11 +1217,14 @@ def main():
 Examples:
   python3 orchestrator_enhanced.py
   python3 orchestrator_enhanced.py --debug   # Enable debug logging
+  python3 orchestrator_enhanced.py --config custom_config.yaml
 
 Notes:
   - Make sure codex and claude CLIs are installed
   - All interactions are logged to orchestrator.log
   - Architecture is extensible for future AI additions
+  - Configuration file support: config.yaml
+  - Conversation history automatically saved
         """
     )
 
@@ -983,30 +1234,86 @@ Notes:
         help='Enable debug logging for detailed output'
     )
 
+    parser.add_argument(
+        '--config',
+        type=str,
+        default='config.yaml',
+        help='Path to configuration file (default: config.yaml)'
+    )
+
+    parser.add_argument(
+        '--no-history',
+        action='store_true',
+        help='Disable conversation history'
+    )
+
     args = parser.parse_args()
 
-    # 如果启用 debug，更新日志级别
-    if args.debug:
-        for handler in logging.root.handlers[:]:
-            logging.root.removeHandler(handler)
+    # 加载配置文件
+    config = None
+    if CONFIG_AVAILABLE:
+        config = ConfigLoader(args.config)
+        if config.load():
+            logger.info(f"✅ 配置文件加载成功: {args.config}")
 
-        logging.basicConfig(
-            level=logging.DEBUG,
-            format='[%(asctime)s] %(name)s: %(message)s',
-            handlers=[
-                logging.StreamHandler(),
-                logging.FileHandler('orchestrator.log')
-            ]
-        )
+            # 从配置更新日志级别
+            log_level = config.get('orchestrator.logging.level', 'INFO')
+            if args.debug:
+                log_level = 'DEBUG'
+
+            for handler in logging.root.handlers[:]:
+                logging.root.removeHandler(handler)
+
+            logging.basicConfig(
+                level=getattr(logging, log_level),
+                format=config.get('orchestrator.logging.format', '[%(asctime)s] %(name)s: %(message)s'),
+                handlers=[
+                    logging.StreamHandler(),
+                    logging.FileHandler(config.get('orchestrator.logging.file', 'orchestrator.log'))
+                ]
+            )
+        else:
+            logger.warning("⚠️  配置文件加载失败，使用默认设置")
+    else:
+        logger.warning("⚠️  配置模块不可用，使用默认设置")
+
+        # 如果启用 debug，更新日志级别
+        if args.debug:
+            for handler in logging.root.handlers[:]:
+                logging.root.removeHandler(handler)
+
+            logging.basicConfig(
+                level=logging.DEBUG,
+                format='[%(asctime)s] %(name)s: %(message)s',
+                handlers=[
+                    logging.StreamHandler(),
+                    logging.FileHandler('orchestrator.log')
+                ]
+            )
+
+    if args.debug:
         logger.info("🔍 Debug mode enabled")
 
     # 创建主控器
     orchestrator = Orchestrator()
 
-    # 注册 Agent（为未来添加更多 AI 预留接口）
-    # 暂时使用两个 Claude 实例进行测试，放弃 codex
-    orchestrator.register_agent("claude-1", "claude")
-    orchestrator.register_agent("claude-2", "claude")
+    # 注册 Agent
+    if config and CONFIG_AVAILABLE:
+        # 从配置文件注册 agents
+        enabled_agents = config.get_enabled_agents()
+        logger.info(f"从配置文件加载 {len(enabled_agents)} 个 Agent")
+
+        for agent_config in enabled_agents:
+            agent_name = agent_config.get('name')
+            agent_command = agent_config.get('command')
+
+            logger.info(f"注册 Agent: {agent_name} ({agent_command})")
+            orchestrator.register_agent(agent_name, agent_command, agent_config)
+    else:
+        # 使用默认配置（两个 Claude 实例）
+        logger.info("使用默认 Agent 配置")
+        orchestrator.register_agent("claude-1", "claude")
+        orchestrator.register_agent("claude-2", "claude")
 
     logger.info("Starting AI Orchestrator (MVP)")
 
@@ -1017,7 +1324,8 @@ Notes:
 
     # 运行交互式会话
     try:
-        session = InteractiveSession(orchestrator)
+        enable_history = not args.no_history
+        session = InteractiveSession(orchestrator, enable_history=enable_history)
         session.run()
 
     except RuntimeError as e:
